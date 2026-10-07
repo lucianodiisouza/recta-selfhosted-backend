@@ -12,7 +12,7 @@ This project is maintained by [PrimoDev](https://www.oprimo.dev).
 
 ## Tech stack
 
-- **Node.js** 20+
+- **Node.js** 20.19+ (or 22.12+)
 - **Fastify** – REST API
 - **PostgreSQL** – database
 - **Prisma** – ORM
@@ -37,7 +37,7 @@ You don't need Firebase to run a working instance — `local` auth mode plus Pos
 
 ### Prerequisites
 
-- Node.js 20+
+- Node.js 20.19+ (or 22.12+)
 - PostgreSQL 16+
 - Firebase project with Authentication enabled
 
@@ -135,6 +135,7 @@ so the schema and endpoints stay in sync.
 | `npm run db:generate` | Generate Prisma Client |
 | `npm run lint` | Lint |
 | `npm run typecheck` | Type check |
+| `npm test` | Unit tests (Vitest, no database needed) |
 
 ## Recurring transactions (cron)
 
@@ -146,6 +147,25 @@ npm run cron:process-recurrences
 ```
 
 Schedule this once per day (cron, systemd, or your host’s scheduler).
+
+## Transaction write hooks (internal)
+
+Code that writes transactions together with rows of its own (an importer recording the external lines a transaction represents, for example) needs those writes to commit or roll back with the transaction and its balance effect. The transaction service exposes hooks for that; none of them is reachable over HTTP.
+
+| Function | Hook | Runs | Throwing |
+|---|---|---|---|
+| `createTransaction(input, userId, hooks)` | `hooks.inTransaction(tx, created)` | after the row and its balance effect were written | rolls the whole create back |
+| `updateTransaction(id, household, input, options)` | `options.beforeWrite(tx)` | after the row is locked and read again, before any balance is touched | nothing is written |
+| | `options.inTransaction(tx)` | after the row was written | rolls the update back |
+| `deleteTransaction(id, household, options)` | `options.guard(tx)` | after the row is locked and read again, before anything is written, for any delete except the three paid cases below (a plain income or expense, paid or not; an unpaid transfer, allocation or split expense; a paid row with no account or category) | nothing is deleted |
+
+`guard` does **not** run for a **paid** transfer, a **paid** allocation or a **paid** split expense, which have their own delete paths.
+
+**Locks, in one order.** `updateTransaction` and `deleteTransaction` both lock the transaction row first (`SELECT ... FOR UPDATE`), read it again, and only then the accounts it touches (several accounts are always locked by id). Because both take their locks in the same order, an update and a delete of the same row, or two moves that cross, wait for each other instead of deadlocking.
+
+**Conflicts and retries.** If someone changed the account, amount or type that the request itself sets, `updateTransaction` answers 409. Any other concurrent change makes the call read the row again and go on, and a Postgres deadlock (SQLSTATE 40P01) is also retried; each call tries up to 3 times, then answers 409. A delete whose row changed between its read and its lock is retried the same way (404 if the row is gone). **The hooks run on every attempt**, each inside a fresh database transaction, so a hook must be safe to run more than once.
+
+**Who uses them.** `inTransaction` on create and `beforeWrite`/`inTransaction` on update are what the card invoice import (record the external refs together with the row) and the review queue (move or delete rows, claiming them first) need; `guard` is for callers that must recheck something atomically with a delete (shares, settlements).
 
 ## Project structure
 
@@ -161,6 +181,10 @@ src/
 │   └── utils/
 └── jobs/               # Cron (e.g. processRecurrences)
 ```
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the checks that must pass before a push, and the pull request rules. User-facing changes are recorded in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
