@@ -1,8 +1,9 @@
 import { Prisma } from '../../generated/prisma/client.js';
 import { prisma } from '../../shared/db/prisma.js';
 import { NotFoundError, BadRequestError } from '../../shared/errors/index.js';
-import { CategoryName, AccountType } from '../../shared/enums/index.js';
-import { applyTransfer } from '../../shared/services/balance.service.js';
+import { localToday } from './accounts.schema.js';
+import { CategoryName, AccountType, TransactionType } from '../../shared/enums/index.js';
+import { applyTransfer, updateBalanceForNormalTransaction, recalculateCreditCardLimit } from '../../shared/services/balance.service.js';
 import type {
   CreateAccountInput,
   UpdateAccountInput,
@@ -736,69 +737,74 @@ export async function transferBetweenAccounts(
 }
 
 /**
- * Manually adjust account balance
+ * Manually adjust account balance: the account ends with exactly input.newBalance and ONE adjustment entry records the
+ * difference (nothing else is touched). The entry is a regular paid INCOME/EXPENSE row with a positive amount, the way
+ * createTransaction stores them, so reports and the balance recompute treat it like any other row:
+ * - bank/cash accounts: a higher balance is an INCOME (OTHER_INCOME), a lower one an EXPENSE (OTHER_EXPENSES);
+ * - credit cards: the balance is the debt, so a higher balance is an EXPENSE and a lower one an INCOME.
+ * The entry is dated input.date (default today): an opening balance dated in the previous year stays out of this year's
+ * reports. The account row is locked (SELECT ... FOR UPDATE) and the difference is computed from the locked row, so two
+ * concurrent submits of the same target apply once: the second one finds difference zero and creates no entry.
  */
 export async function adjustBalance(
   accountId: string,
   householdId: string,
   input: AdjustBalanceInput
 ) {
-  const account = await prisma.account.findFirst({
+  const exists = await prisma.account.findFirst({
     where: { id: accountId, householdId },
+    select: { id: true },
   });
 
-  if (!account) {
+  if (!exists) {
     throw new NotFoundError('Account');
   }
 
-  // Calculate difference based on totalBalance (not legacy balance)
-  const currentTotalBalance = account.totalBalance?.toNumber() || account.balance.toNumber();
-  const difference = new Prisma.Decimal(input.newBalance).minus(new Prisma.Decimal(currentTotalBalance));
+  const target = new Prisma.Decimal(input.newBalance);
+  // The schema already trims the reason; an empty one falls back to the default.
+  const reason = input.reason || 'Balance adjustment';
 
-  if (difference.isZero()) {
-    return { account, adjustment: null };
-  }
+  return prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+    await tx.$queryRaw`SELECT id FROM accounts WHERE id = ${accountId}::uuid FOR UPDATE`;
+    const account = await tx.account.findFirst({ where: { id: accountId, householdId } });
+    if (!account) {
+      throw new NotFoundError('Account');
+    }
 
-  // Determinar categoria baseado no tipo de ajuste (receita ou despesa)
-  const categoryName = difference.isPositive() 
-    ? CategoryName.OTHER_INCOME 
-    : CategoryName.OTHER_EXPENSES;
+    // The difference is taken against totalBalance (available + allocated), the balance the app shows.
+    const difference = target.minus(account.totalBalance);
+    if (difference.isZero()) {
+      return { account, adjustment: null };
+    }
 
-  const differenceAmount = difference.toNumber();
+    const isCreditCard = account.type === AccountType.CREDIT;
+    // A card's balance is its debt: more debt is an expense, less debt a credit.
+    const isIncome = isCreditCard ? difference.isNegative() : difference.isPositive();
+    const date = input.date ?? localToday();
 
-  // Update balance and create adjustment transaction
-  const result = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
-    // Update all balance fields to maintain consistency
-    const updatedAccount = await tx.account.update({
-      where: { id: accountId },
-      data: { 
-        balance: input.newBalance, // Legacy field
-        totalBalance: input.newBalance, // Total balance
-        availableBalance: { increment: differenceAmount }, // Adjust available balance
-        // allocatedBalance remains unchanged (adjustment affects available, not allocated)
-      },
-    });
-
-    const adjustmentTransaction = await tx.transaction.create({
+    const adjustment = await tx.transaction.create({
       data: {
         householdId,
         accountId,
-        categoryName,
-        amount: difference.toNumber(),
-        description: input.reason || 'Balance adjustment',
-        date: new Date(),
-        notes: `Previous balance: ${account.balance}, New balance: ${input.newBalance}`,
+        type: isIncome ? TransactionType.INCOME : TransactionType.EXPENSE,
+        categoryName: isIncome ? CategoryName.OTHER_INCOME : CategoryName.OTHER_EXPENSES,
+        amount: difference.abs(),
+        description: reason,
+        date,
+        notes: `Previous balance: ${account.totalBalance.toFixed(2)}, New balance: ${target.toFixed(2)}`,
         paid: true, // Ajustes são sempre considerados pagos
       },
     });
 
-    return {
-      account: updatedAccount,
-      adjustment: adjustmentTransaction,
-    };
-  });
+    // The balance always moves by the signed difference (for a card, more debt is a positive change).
+    await updateBalanceForNormalTransaction(tx, accountId, difference.toNumber());
+    if (isCreditCard) {
+      await recalculateCreditCardLimit(tx, accountId);
+    }
 
-  return result;
+    const updatedAccount = await tx.account.findUniqueOrThrow({ where: { id: accountId } });
+    return { account: updatedAccount, adjustment: { ...adjustment, amount: adjustment.amount.toNumber() } };
+  });
 }
 
 /**

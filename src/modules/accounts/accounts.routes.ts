@@ -423,8 +423,11 @@ export async function accountRoutes(app: FastifyInstance) {
         },
         body: {
           type: 'object',
+          required: ['newBalance'],
           properties: {
-            amount: { type: 'number' },
+            // No `type` here: Ajv would coerce null/false to 0 before zod runs. adjustBalanceSchema validates it.
+            newBalance: { description: 'Target balance: a number or a numeric string with at most two decimals' },
+            date: { type: 'string', description: 'YYYY-MM-DD, not in the future (default: today)' },
             reason: { type: 'string' },
           },
         },
