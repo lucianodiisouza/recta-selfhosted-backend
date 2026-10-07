@@ -12,7 +12,7 @@ This project is maintained by [PrimoDev](https://www.oprimo.dev).
 
 ## Tech stack
 
-- **Node.js** 20+
+- **Node.js** 20.19+ (or 22.12+)
 - **Fastify** – REST API
 - **PostgreSQL** – database
 - **Prisma** – ORM
@@ -37,7 +37,7 @@ You don't need Firebase to run a working instance — `local` auth mode plus Pos
 
 ### Prerequisites
 
-- Node.js 20+
+- Node.js 20.19+ (or 22.12+)
 - PostgreSQL 16+
 - Firebase project with Authentication enabled
 
@@ -135,6 +135,7 @@ so the schema and endpoints stay in sync.
 | `npm run db:generate` | Generate Prisma Client |
 | `npm run lint` | Lint |
 | `npm run typecheck` | Type check |
+| `npm test` | Unit tests (Vitest, no database needed) |
 
 ## Recurring transactions (cron)
 
@@ -146,6 +147,22 @@ npm run cron:process-recurrences
 ```
 
 Schedule this once per day (cron, systemd, or your host’s scheduler).
+
+A monthly recurrence has at most one occurrence per month: executing it (cron, `POST /recurring-transactions/:id/execute`, or right after creating or editing it) only moves `nextRunAt` on when a transaction of that recurrence already exists in the month (for example one linked by the detector). Weekly, biweekly and daily recurrences are not affected.
+
+### Detecting recurring expenses
+
+`POST /recurring-transactions/detect` (any household member) reads the household's expense history and proposes monthly recurrences; `POST /recurring-transactions/detect/apply` (EDITOR+) creates the ones the user picks. Bodies: `{ householdId, minMonths?, months? }` (defaults 3 and 12; `minMonths` 2-12, `months` 3-36, `minMonths <= months`) and `{ householdId, minMonths?, months?, items: [{ id, amount?, dayOfMonth?, description?, followLastAmount? }] }` (1-300 items).
+
+- Only paid, non-installment expenses in the window count. Income, unpaid rows, future-dated rows, installments, invoice payments and what an active recurrence already covers (same account and normalized description, or already linked to it) are left out; `skipped` counts what was left out by reason (`alreadyRecurring`, `installments`, `sparse`, `consumption`).
+- Groups are keyed by account + normalized description (accents, case, `N/M` tokens, loose numbers and punctuation dropped). A candidate needs `minMonths` distinct months, month coverage of at least 50% between its first and last month, and a last paid month no older than the previous month.
+- `kind: 'stable'`: at least 80% of the monthly values within `max(0.50, 10%)` of the median, and not several charges per month (consumption such as fuel or bakery stays out). `kind: 'bill'`: at least 3 months and a most frequent category that is a system `UTILITIES` or `HOUSING`; bills enter whatever their variation.
+- `amount` is the latest real value, `medianAmount`/`minAmount`/`maxAmount` summarise the window, `dayOfMonth` is the most common day, `defaultSelected` means 3+ months and no gap of two or more months, `followLastAmount` is true by default. Ids are deterministic (account + normalized description).
+- Apply recomputes everything on the server inside one database transaction under a per-household lock: ids that no longer exist count as `skipped` (so repeating a call creates nothing), each chosen candidate becomes a MONTHLY recurrence starting at the first month after its last paid one that has no expense of the group yet (on its day, clamped to the month length), and the historical transactions are linked to it (`recurringTransactionId`) without touching any balance. Anything it declined to do comes back in `warnings` as `{ code, description, dayOfMonth? }` (`duplicate-in-call`, `already-active`, `short-month-day`) for the client to translate.
+
+### Following the last real value
+
+A recurrence with `followLastAmount: true` predicts the next value as the last real one. When `PATCH /transactions/:id` changes the amount of the most recent occurrence of such an active recurrence (largest date, not beyond today + 31 days), the recurrence `amount` is updated in the same database transaction and the response carries `recurringUpdated: { id, amount }`. Editing or paying an older occurrence never changes the recurrence. `GET /recurring-transactions` items carry `lastOccurrenceDate` (latest occurrence up to today + 31 days). `followLastAmount` is accepted by `POST` and `PATCH /recurring-transactions` and returned with every recurrence.
 
 ## Project structure
 
@@ -161,6 +178,10 @@ src/
 │   └── utils/
 └── jobs/               # Cron (e.g. processRecurrences)
 ```
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the checks that must pass before a push, and the pull request rules. User-facing changes are recorded in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

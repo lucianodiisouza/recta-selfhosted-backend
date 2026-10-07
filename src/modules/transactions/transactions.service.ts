@@ -704,13 +704,19 @@ export async function listTransactions(query: ListTransactionsQuery) {
   return createPaginatedResponse(convertedTransactions, limit, total);
 }
 
+/** Hooks of updateTransaction. `inTransaction` runs inside the same database transaction as the update. */
+export interface UpdateTransactionHooks {
+  inTransaction?: (tx: Prisma.TransactionClient) => Promise<void>;
+}
+
 /**
  * Update transaction
  */
 export async function updateTransaction(
   transactionId: string,
   householdId: string,
-  input: UpdateTransactionInput
+  input: UpdateTransactionInput,
+  hooks?: UpdateTransactionHooks
 ) {
   const existingTransaction = await prisma.transaction.findFirst({
     where: { id: transactionId, householdId },
@@ -862,6 +868,8 @@ export async function updateTransaction(
         },
       },
     });
+
+    if (hooks?.inTransaction) await hooks.inTransaction(tx);
 
     // Recalculate credit card limit if transaction is on a credit card
     if (transaction.account?.type === AccountType.CREDIT) {
