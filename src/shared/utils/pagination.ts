@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import type { Prisma } from '../../generated/prisma/client.js';
 
 /**
  * Pagination query schema for cursor-based pagination
@@ -9,6 +10,17 @@ export const paginationSchema = z.object({
 });
 
 export type PaginationQuery = z.infer<typeof paginationSchema>;
+
+/**
+ * Order of every cursor-paginated transaction listing. Cursor pagination needs a total order: `date` is a day
+ * and many rows share it, so `createdAt` and finally the unique `id` break the ties. With ties left, consecutive
+ * pages may repeat or skip rows.
+ */
+export const PAGINATED_TRANSACTION_ORDER: Prisma.TransactionOrderByWithRelationInput[] = [
+  { date: 'desc' },
+  { createdAt: 'desc' },
+  { id: 'desc' },
+];
 
 /**
  * Paginated response structure

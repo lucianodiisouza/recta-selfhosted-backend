@@ -5,6 +5,7 @@ import {
   createPaginatedResponse,
   buildPaginationArgs,
   parseMonthFilter,
+  PAGINATED_TRANSACTION_ORDER,
 } from '../../shared/utils/pagination.js';
 import { CategoryType, getCategoriesByType, getCategoryColor, AccountType, TransactionType, CATEGORY_NAME_DISPLAY } from '../../shared/enums/index.js';
 import { CategoryName } from '../../shared/enums/index.js';
@@ -685,7 +686,7 @@ export async function listTransactions(query: ListTransactionsQuery) {
         select: { id: true, name: true, type: true },
       },
     },
-    orderBy: [{ date: 'desc' }, { createdAt: 'desc' }],
+    orderBy: PAGINATED_TRANSACTION_ORDER,
   });
 
   // Get total count for the filters
@@ -1930,14 +1931,14 @@ export async function calculateCreditCardInvoice(
   const allInvoiceTransactions = pagination?.cursor
     ? await prisma.transaction.findMany({
         where: whereClause,
-        orderBy: { date: 'desc' },
+        orderBy: PAGINATED_TRANSACTION_ORDER,
         take: limit + 1,
         cursor: { id: pagination.cursor },
         skip: 1,
       })
     : await prisma.transaction.findMany({
         where: whereClause,
-        orderBy: { date: 'desc' },
+        orderBy: PAGINATED_TRANSACTION_ORDER,
         take: limit + 1,
       });
 
