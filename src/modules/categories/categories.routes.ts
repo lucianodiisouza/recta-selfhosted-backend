@@ -20,8 +20,12 @@ import {
   updateCategorySchema,
   categoryIdParamSchema,
   listCategoriesQuerySchema,
+  mergeCategoryBodySchema,
+  mergeCategoryQuerySchema,
 } from './categories.schema.js';
+import { toCustomCategoryName } from '../../shared/utils/categoryHelpers.js';
 import * as categoriesService from './categories.service.js';
+import * as mergeService from './categories.merge.service.js';
 
 export async function categoryRoutes(app: FastifyInstance) {
   app.addHook('preHandler', authMiddleware());
@@ -59,6 +63,15 @@ export async function categoryRoutes(app: FastifyInstance) {
                   color: { type: 'string' },
                   icon: { type: 'string', nullable: true },
                   isSystem: { type: 'boolean' },
+                  usage: {
+                    type: 'object',
+                    nullable: true,
+                    properties: {
+                      transactions: { type: 'integer' },
+                      recurringTransactions: { type: 'integer' },
+                      budgets: { type: 'integer' },
+                    },
+                  },
                 },
               },
             },
@@ -90,6 +103,8 @@ export async function categoryRoutes(app: FastifyInstance) {
       icon: null as string | null,
       isSystem: true as const,
     }));
+    const usageMap = query.includeUsage === 'true' ? await categoriesService.getCategoryUsage(householdId) : null;
+    const emptyUsage = { transactions: 0, recurringTransactions: 0, budgets: 0 };
 
     const custom = await categoriesService.listCategories({ householdId, type });
     const customMapped = custom.map((c) => ({
@@ -99,11 +114,15 @@ export async function categoryRoutes(app: FastifyInstance) {
       color: c.color ?? '#64748B',
       icon: c.icon,
       isSystem: false as const,
+      ...(usageMap && { usage: usageMap.get(toCustomCategoryName(c.id)) ?? emptyUsage }),
     }));
+    const systemMapped = usageMap
+      ? system.map((c) => ({ ...c, usage: usageMap.get(c.id) ?? emptyUsage }))
+      : system;
 
     return reply.send({
       success: true,
-      data: [...system, ...customMapped],
+      data: [...systemMapped, ...customMapped],
     });
   });
 
@@ -117,7 +136,7 @@ export async function categoryRoutes(app: FastifyInstance) {
       tags: ['Categories'],
       security: [{ bearerAuth: [] }],
       params: { type: 'object', required: ['id'], properties: { id: { type: 'string' } } },
-      response: { 200: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object' } } } },
+      response: { 200: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object', additionalProperties: true } } } },
     },
   }, async (request, reply) => {
     const { id } = request.params;
@@ -177,7 +196,7 @@ export async function categoryRoutes(app: FastifyInstance) {
         },
         required: ['name', 'type'],
       },
-      response: { 200: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object' } } } },
+      response: { 200: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object', additionalProperties: true } } } },
     },
   }, async (request, reply) => {
     const body = createCategorySchema.parse(request.body);
@@ -209,7 +228,7 @@ export async function categoryRoutes(app: FastifyInstance) {
       security: [{ bearerAuth: [] }],
       params: { type: 'object', required: ['categoryId'], properties: { categoryId: { type: 'string', format: 'uuid' } } },
       body: { type: 'object', properties: { name: { type: 'string' }, icon: { type: 'string', nullable: true }, color: { type: 'string', nullable: true } } },
-      response: { 200: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object' } } } },
+      response: { 200: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object', additionalProperties: true } } } },
     },
   }, async (request, reply) => {
     const { categoryId } = categoryIdParamSchema.parse(request.params);
@@ -256,5 +275,43 @@ export async function categoryRoutes(app: FastifyInstance) {
 
     await categoriesService.deleteCategory(categoryId, cat.householdId);
     return reply.send({ success: true });
+  });
+
+  /**
+   * POST /categories/:categoryId/merge[?preview=true]
+   * Body: { targetCategoryId } (custom) or { targetSystemName } (system enum value, same type).
+   * Moves transactions, recurring transactions and budgets of the source (a custom category) to the target and
+   * deletes the source, atomically. With preview=true nothing is written and the counts are returned.
+   * A source that no longer exists (already merged) is 404 and changes nothing.
+   */
+  app.post<{ Params: { categoryId: string } }>('/:categoryId/merge', {
+    schema: {
+      description: 'Merge a custom category into another category of the same type (EDITOR+); preview=true only counts',
+      tags: ['Categories'],
+      security: [{ bearerAuth: [] }],
+      params: { type: 'object', required: ['categoryId'], properties: { categoryId: { type: 'string', format: 'uuid' } } },
+      querystring: { type: 'object', properties: { preview: { type: 'string', enum: ['true', 'false'] } } },
+      body: {
+        type: 'object',
+        properties: { targetCategoryId: { type: 'string', format: 'uuid' }, targetSystemName: { type: 'string' } },
+      },
+      response: { 200: { type: 'object', properties: { success: { type: 'boolean' }, data: { type: 'object', additionalProperties: true } } } },
+    },
+  }, async (request, reply) => {
+    const { categoryId } = categoryIdParamSchema.parse(request.params);
+    const body = mergeCategoryBodySchema.parse(request.body);
+    const { preview } = mergeCategoryQuerySchema.parse(request.query);
+
+    const householdId = await mergeService.findSourceHousehold(categoryId);
+    if (!householdId) throw new NotFoundError('Category');
+    await requireEditor(request, householdId);
+
+    const data = await mergeService.mergeCategory(householdId, {
+      sourceId: categoryId,
+      targetCategoryId: body.targetCategoryId,
+      targetSystemName: body.targetSystemName,
+      preview: preview === 'true',
+    });
+    return reply.send({ success: true, data });
   });
 }

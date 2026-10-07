@@ -12,7 +12,7 @@ This project is maintained by [PrimoDev](https://www.oprimo.dev).
 
 ## Tech stack
 
-- **Node.js** 20+
+- **Node.js** 20.19+ (or 22.12+)
 - **Fastify** – REST API
 - **PostgreSQL** – database
 - **Prisma** – ORM
@@ -37,7 +37,7 @@ You don't need Firebase to run a working instance — `local` auth mode plus Pos
 
 ### Prerequisites
 
-- Node.js 20+
+- Node.js 20.19+ (or 22.12+)
 - PostgreSQL 16+
 - Firebase project with Authentication enabled
 
@@ -135,6 +135,7 @@ so the schema and endpoints stay in sync.
 | `npm run db:generate` | Generate Prisma Client |
 | `npm run lint` | Lint |
 | `npm run typecheck` | Type check |
+| `npm test` | Unit tests (Vitest, no database needed) |
 
 ## Recurring transactions (cron)
 
@@ -146,6 +147,34 @@ npm run cron:process-recurrences
 ```
 
 Schedule this once per day (cron, systemd, or your host’s scheduler).
+
+A monthly recurrence has at most one occurrence per month: executing it (cron, `POST /recurring-transactions/:id/execute`, or right after creating or editing it) only moves `nextRunAt` on when a transaction of that recurrence already exists in the month (for example one linked by the detector). Weekly, biweekly and daily recurrences are not affected.
+
+### Detecting recurring expenses
+
+`POST /recurring-transactions/detect` (any household member) reads the household's expense history and proposes monthly recurrences; `POST /recurring-transactions/detect/apply` (EDITOR+) creates the ones the user picks. Bodies: `{ householdId, minMonths?, months? }` (defaults 3 and 12; `minMonths` 2-12, `months` 3-36, `minMonths <= months`) and `{ householdId, minMonths?, months?, items: [{ id, amount?, dayOfMonth?, description?, followLastAmount? }] }` (1-300 items).
+
+- Only paid, non-installment expenses in the window count. Income, unpaid rows, future-dated rows, installments, invoice payments and what an active recurrence already covers (same account and normalized description, or already linked to it) are left out; `skipped` counts what was left out by reason (`alreadyRecurring`, `installments`, `sparse`, `consumption`).
+- Groups are keyed by account + normalized description (accents, case, `N/M` tokens, loose numbers and punctuation dropped). A candidate needs `minMonths` distinct months, month coverage of at least 50% between its first and last month, and a last paid month no older than the previous month.
+- `kind: 'stable'`: at least 80% of the monthly values within `max(0.50, 10%)` of the median, and not several charges per month (consumption such as fuel or bakery stays out). `kind: 'bill'`: at least 3 months and a most frequent category that is a system `UTILITIES` or `HOUSING`; bills enter whatever their variation.
+- `amount` is the latest real value, `medianAmount`/`minAmount`/`maxAmount` summarise the window, `dayOfMonth` is the most common day, `defaultSelected` means 3+ months and no gap of two or more months, `followLastAmount` is true by default. Ids are deterministic (account + normalized description).
+- Apply recomputes everything on the server inside one database transaction under a per-household lock: ids that no longer exist count as `skipped` (so repeating a call creates nothing), each chosen candidate becomes a MONTHLY recurrence starting at the first month after its last paid one that has no expense of the group yet (on its day, clamped to the month length), and the historical transactions are linked to it (`recurringTransactionId`) without touching any balance. Anything it declined to do comes back in `warnings` as `{ code, description, dayOfMonth? }` (`duplicate-in-call`, `already-active`, `short-month-day`) for the client to translate.
+
+### Following the last real value
+
+A recurrence with `followLastAmount: true` predicts the next value as the last real one. When `PATCH /transactions/:id` changes the amount of the most recent occurrence of such an active recurrence (largest date, not beyond today + 31 days), the recurrence `amount` is updated in the same database transaction and the response carries `recurringUpdated: { id, amount }`. Editing or paying an older occurrence never changes the recurrence. `GET /recurring-transactions` items carry `lastOccurrenceDate` (latest occurrence up to today + 31 days). `followLastAmount` is accepted by `POST` and `PATCH /recurring-transactions` and returned with every recurrence.
+
+## Categories
+
+Custom categories belong to a household. Transactions, recurring transactions and budgets reference one as `CUSTOM:<category id>`, so renaming never touches them.
+
+- Names are unique per household and type, ignoring case, accents and extra spaces, and may not equal a system category of the same type. A clash is `409 CATEGORY_NAME_TAKEN` on create and on rename. `POST` and `PATCH /categories` also change colour and icon.
+- `GET /categories?includeUsage=true` adds `usage: { transactions, recurringTransactions, budgets }` to every category, system and custom.
+- `DELETE /categories/:categoryId` is refused (`400 CATEGORY_IN_USE`) while anything references the category; the check and the delete run in one database transaction holding the category row lock.
+- `POST /categories/:categoryId/merge` (EDITOR+ on the household that owns the source) moves everything of a custom category into another category of the same type and deletes the source, in one database transaction. Body: `{ targetCategoryId }` (a custom category of the same household) or `{ targetSystemName }` (a system category), exactly one. `?preview=true` runs the same validation and returns the counts without writing. Budgets of a month the target already has are added together. Refusals: `CATEGORY_MERGE_SELF`, `CATEGORY_MERGE_TYPE_MISMATCH`, `CATEGORY_MERGE_TARGET_INVALID` (400); a source or target that does not exist in the household is 404, which also makes a repeated merge a harmless no-op.
+- Name uniqueness is checked before the insert and backed by the existing unique index on the exact name only, so several simultaneous creates of names that differ only by case, accents or spaces ("Cafe Race" / "CAFÉ race") can all succeed. Merging the duplicates fixes it. To find them in a database: `SELECT household_id, type, lower(unaccent(regexp_replace(btrim(name), '\s+', ' ', 'g'))) AS normalized, count(*) FROM categories GROUP BY 1, 2, 3 HAVING count(*) > 1;` (needs the `unaccent` extension; without it use `lower(regexp_replace(btrim(name), '\s+', ' ', 'g'))`).
+- Split transactions store their category on the member's personal household, outside the household that owns the category, so a merge or delete of that category does not see them (known limitation, not changed here).
+- Every writer of a category name shares the category row lock (`lockCustomCategory`), so a write racing a merge or a delete is either moved by the merge or refused with `400`, never left pointing at a deleted category. Merges lock their two categories in id order, so two opposite merges cannot deadlock.
 
 ## Project structure
 
@@ -161,6 +190,10 @@ src/
 │   └── utils/
 └── jobs/               # Cron (e.g. processRecurrences)
 ```
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the checks that must pass before a push, and the pull request rules. User-facing changes are recorded in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

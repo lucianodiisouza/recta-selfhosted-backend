@@ -22,6 +22,8 @@ export const createRecurringTransactionSchema = z.object({
   endDate: localDateSchema.optional(),
   nextRunAt: localDateSchema,
   isActive: z.boolean().default(true),
+  // When true, editing the most recent occurrence updates the recurrence amount (predicts the next value)
+  followLastAmount: z.boolean().default(false),
 });
 
 export type CreateRecurringTransactionInput = z.infer<
@@ -41,6 +43,7 @@ export const updateRecurringTransactionSchema = z.object({
   endDate: localDateSchema.nullable().optional(),
   nextRunAt: localDateSchema.optional(),
   isActive: z.boolean().optional(),
+  followLastAmount: z.boolean().optional(),
 });
 
 export type UpdateRecurringTransactionInput = z.infer<
@@ -85,3 +88,45 @@ export type ExecuteRecurringTransactionInput = z.infer<
   typeof executeRecurringTransactionSchema
 >;
 
+
+/**
+ * Detect recurring expenses (POST /recurring-transactions/detect) and apply the chosen candidates
+ * (POST /recurring-transactions/detect/apply). Caps keep the work bounded.
+ */
+const detectWindowShape = {
+  householdId: z.string().uuid(),
+  minMonths: z.number().int().min(2).max(12).optional(),
+  months: z.number().int().min(3).max(36).optional(),
+};
+
+function minMonthsFitsWindow(v: { minMonths?: number; months?: number }): boolean {
+  return (v.minMonths ?? 3) <= (v.months ?? 12);
+}
+
+export const detectRecurringSchema = z
+  .object(detectWindowShape)
+  .refine(minMonthsFitsWindow, { message: 'minMonths cannot exceed months', path: ['minMonths'] });
+
+export type DetectRecurringInput = z.infer<typeof detectRecurringSchema>;
+
+export const MAX_DETECT_APPLY_ITEMS = 300;
+
+export const detectApplySchema = z
+  .object({
+    ...detectWindowShape,
+    items: z
+      .array(
+        z.object({
+          id: z.string().min(1).max(64),
+          amount: z.number().positive().max(1_000_000_000).optional(),
+          dayOfMonth: z.number().int().min(1).max(31).optional(),
+          description: z.string().trim().min(1).max(255).optional(),
+          followLastAmount: z.boolean().optional(),
+        }),
+      )
+      .min(1)
+      .max(MAX_DETECT_APPLY_ITEMS),
+  })
+  .refine(minMonthsFitsWindow, { message: 'minMonths cannot exceed months', path: ['minMonths'] });
+
+export type DetectApplyInput = z.infer<typeof detectApplySchema>;

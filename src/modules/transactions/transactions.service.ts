@@ -9,6 +9,7 @@ import {
 import { CategoryType, getCategoriesByType, getCategoryColor, AccountType, TransactionType, CATEGORY_NAME_DISPLAY } from '../../shared/enums/index.js';
 import { CategoryName } from '../../shared/enums/index.js';
 import { isCustomCategoryName, toCustomCategoryId, toCustomCategoryName } from '../../shared/utils/categoryHelpers.js';
+import { lockCustomCategory } from '../../shared/utils/categoryLock.js';
 import { executeRecurringTransaction } from '../recurring-transactions/recurring-transactions.service.js';
 import { applyTransfer, applyAllocation, applyDeallocation, recalculateCreditCardLimit, updateBalanceForNormalTransaction } from '../../shared/services/balance.service.js';
 import type {
@@ -173,6 +174,8 @@ export async function createTransaction(input: CreateTransactionInput, userId?: 
   const isSplit = input.isSplit === true && input.splits && input.splits.length > 0;
   
   const result = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+    // A custom category must still exist when the row is written (a merge/delete holds it FOR UPDATE), also with an explicit type.
+    await lockCustomCategory(tx, householdId, categoryName);
     const transaction = await tx.transaction.create({
       data: {
         householdId,
@@ -704,13 +707,19 @@ export async function listTransactions(query: ListTransactionsQuery) {
   return createPaginatedResponse(convertedTransactions, limit, total);
 }
 
+/** Hooks of updateTransaction. `inTransaction` runs inside the same database transaction as the update. */
+export interface UpdateTransactionHooks {
+  inTransaction?: (tx: Prisma.TransactionClient) => Promise<void>;
+}
+
 /**
  * Update transaction
  */
 export async function updateTransaction(
   transactionId: string,
   householdId: string,
-  input: UpdateTransactionInput
+  input: UpdateTransactionInput,
+  hooks?: UpdateTransactionHooks
 ) {
   const existingTransaction = await prisma.transaction.findFirst({
     where: { id: transactionId, householdId },
@@ -778,6 +787,9 @@ export async function updateTransaction(
 
   // Update transaction and adjust balances
   const result = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+    // The new custom category must still exist when the row is written (a merge/delete holds it FOR UPDATE).
+    if (input.categoryName) await lockCustomCategory(tx, householdId, input.categoryName);
+
     // Case 1: Type changed (INCOME <-> EXPENSE) - need to reverse old balance and apply new balance
     // This handles type change alone or with other changes
     if (typeChanged && oldAccountId && oldAccountType && oldCategoryName) {
@@ -862,6 +874,8 @@ export async function updateTransaction(
         },
       },
     });
+
+    if (hooks?.inTransaction) await hooks.inTransaction(tx);
 
     // Recalculate credit card limit if transaction is on a credit card
     if (transaction.account?.type === AccountType.CREDIT) {
@@ -1199,6 +1213,9 @@ export async function batchCreateTransactions(input: BatchCreateTransactionsInpu
 
   // Execute batch creation
   const result = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+    // Every distinct custom category is share-locked (ids sorted: a stable lock order) and must still exist.
+    const customNames = [...new Set(transactionsData.map((t: { categoryName: string }) => t.categoryName).filter((n: string) => isCustomCategoryName(n)))].sort() as string[];
+    for (const name of customNames) await lockCustomCategory(tx, householdId, name);
     const created = await tx.transaction.createMany({
       data: transactionsData.map((t: { accountId: string; categoryName: string; amount: number; description?: string; date: Date; notes?: string; paid: boolean; recurringTransactionId?: string; installmentId?: string; installmentNumber?: number; totalInstallments?: number }) => {
         const isInc = isIncomeForCategory(t.categoryName);

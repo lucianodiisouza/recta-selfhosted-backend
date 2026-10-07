@@ -17,3 +17,8 @@ export function toCustomCategoryId(categoryName: string): string | null {
 export function toCustomCategoryName(categoryId: string): string {
   return `${CUSTOM_CATEGORY_PREFIX}${categoryId}`;
 }
+
+/** Case/accent/space-insensitive form used to compare category names. */
+export function normalizeCategoryName(name: string): string {
+  return name.normalize('NFD').replace(/\p{M}/gu, '').replace(/\s+/g, ' ').trim().toLowerCase();
+}

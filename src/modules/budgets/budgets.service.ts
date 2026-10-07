@@ -4,6 +4,7 @@ import { NotFoundError, BadRequestError } from '../../shared/errors/index.js';
 import { parseMonthFilter } from '../../shared/utils/pagination.js';
 import { CategoryType, GENERAL_BUDGET_CATEGORY, getCategoriesByType, getCategoryColor } from '../../shared/enums/index.js';
 import { isCustomCategoryName, toCustomCategoryId } from '../../shared/utils/categoryHelpers.js';
+import { lockCustomCategory } from '../../shared/utils/categoryLock.js';
 import type {
   CreateBudgetInput,
   UpdateBudgetInput,
@@ -60,14 +61,17 @@ export async function createBudget(input: CreateBudgetInput) {
     throw new BadRequestError('Budget already exists for this category and month');
   }
 
-  const budget = await prisma.budget.create({
-    data: {
-      householdId,
-      categoryName,
-      monthlyLimit: new Prisma.Decimal(monthlyLimit),
-      month: monthStart,
-      type,
-    },
+  const budget = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+    await lockCustomCategory(tx, householdId, categoryName);
+    return tx.budget.create({
+      data: {
+        householdId,
+        categoryName,
+        monthlyLimit: new Prisma.Decimal(monthlyLimit),
+        month: monthStart,
+        type,
+      },
+    });
   });
 
   // Convert Prisma.Decimal to number for JSON serialization

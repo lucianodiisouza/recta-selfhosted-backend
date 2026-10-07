@@ -8,3 +8,4 @@ export * from './categories.service.js';
 
 
 
+export * from './categories.merge.service.js';

@@ -11,7 +11,10 @@ import {
   executeRecurringTransactionSchema,
   recurringTransactionIdParamSchema,
   listRecurringTransactionsQuerySchema,
+  detectRecurringSchema,
+  detectApplySchema,
 } from './recurring-transactions.schema.js';
+import { applyDetectedRecurrences, detectRecurringTransactions } from './recurring-detect.service.js';
 import * as recurringTransactionsService from './recurring-transactions.service.js';
 
 export async function recurringTransactionRoutes(app: FastifyInstance) {
@@ -159,6 +162,57 @@ export async function recurringTransactionRoutes(app: FastifyInstance) {
       success: true,
       data: recurring,
     });
+  });
+
+  const bodySchema = {
+    type: 'object',
+    required: ['householdId'],
+    properties: { householdId: { type: 'string' } },
+    additionalProperties: true,
+  } as const;
+  const okData = {
+    type: 'object',
+    properties: { success: { type: 'boolean' }, data: { type: 'object', additionalProperties: true } },
+  } as const;
+
+  /**
+   * POST /recurring-transactions/detect
+   * Candidates for monthly recurrences found in the expense history (read only, any member).
+   */
+  app.post('/detect', {
+    schema: {
+      description:
+        'Detect recurring expenses (stable amounts and monthly bills) in the household history. Body: { householdId, minMonths?, months? }. Read only: any member.',
+      tags: ['Recurring Transactions'],
+      security: [{ bearerAuth: [] }],
+      body: bodySchema,
+      response: { 200: okData },
+    },
+  }, async (request, reply) => {
+    const input = detectRecurringSchema.parse(request.body);
+    await requireHouseholdMember(request, input.householdId);
+    const data = await detectRecurringTransactions(input);
+    return reply.send({ success: true, data });
+  });
+
+  /**
+   * POST /recurring-transactions/detect/apply
+   * Creates the recurrences for the chosen candidates (EDITOR+). The server recomputes the candidates.
+   */
+  app.post('/detect/apply', {
+    schema: {
+      description:
+        'Create monthly recurrences from detected candidates (EDITOR+). Body: { householdId, minMonths?, months?, items: [{ id, amount?, dayOfMonth?, description?, followLastAmount? }] }. The server recomputes the candidates; ids that no longer exist count as skipped; idempotent. Links the history to the new recurrences without touching balances.',
+      tags: ['Recurring Transactions'],
+      security: [{ bearerAuth: [] }],
+      body: bodySchema,
+      response: { 201: okData },
+    },
+  }, async (request, reply) => {
+    const input = detectApplySchema.parse(request.body);
+    await requireEditor(request, input.householdId);
+    const data = await applyDetectedRecurrences(input);
+    return reply.status(201).send({ success: true, data });
   });
 
   /**

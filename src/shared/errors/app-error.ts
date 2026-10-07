@@ -100,6 +100,13 @@ export class CategoryInUseError extends AppError {
   }
 }
 
+/** 400: a category merge that cannot happen (code tells the UI why: CATEGORY_MERGE_SELF, CATEGORY_MERGE_TYPE_MISMATCH, CATEGORY_MERGE_TARGET_INVALID) */
+export class CategoryMergeError extends AppError {
+  constructor(code: 'CATEGORY_MERGE_SELF' | 'CATEGORY_MERGE_TYPE_MISMATCH' | 'CATEGORY_MERGE_TARGET_INVALID', message: string) {
+    super(message, 400, code);
+  }
+}
+
 // ============================================================================
 // CONFLICT ERRORS (409)
 // ============================================================================
@@ -107,6 +114,13 @@ export class CategoryInUseError extends AppError {
 export class ConflictError extends AppError {
   constructor(message: string = 'Resource already exists') {
     super(message, 409, 'CONFLICT');
+  }
+}
+
+/** 409: another category (custom or system) of the same type already has this name */
+export class CategoryNameTakenError extends AppError {
+  constructor(message: string = 'Category with this name and type already exists') {
+    super(message, 409, 'CATEGORY_NAME_TAKEN');
   }
 }
 

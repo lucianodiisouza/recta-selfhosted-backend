@@ -376,6 +376,8 @@ model RecurringTransaction {
   nextRunAt    DateTime            @map("next_run_at") @db.Date
   lastRunDate  DateTime?           @map("last_run_date") @db.Date
   isActive     Boolean             @default(true) @map("is_active")
+  // When true, editing the most recent occurrence updates `amount` (predict the next value as the last real one)
+  followLastAmount Boolean         @default(false) @map("follow_last_amount")
   createdAt    DateTime            @default(now()) @map("created_at")
   updatedAt    DateTime            @updatedAt @map("updated_at")
 

@@ -165,6 +165,13 @@ async function processDueRecurringTransactions() {
           });
         }
 
+        if (result.skipped) {
+          // The month already holds an occurrence of this recurrence (idempotency guard): nothing was created.
+          skippedCount++;
+          console.log(`[CronJob] ⏭️  Skipping recurring ${recurring.id} - the month already has its occurrence`);
+          continue;
+        }
+
         processedCount++;
         console.log(
           `[CronJob] ✅ Processed recurring ${recurring.id} (${recurring.description || 'N/A'}) - ` +
