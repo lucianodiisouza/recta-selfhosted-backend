@@ -1,6 +1,7 @@
 import Fastify, { type FastifyInstance } from 'fastify';
 import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
+import multipart from '@fastify/multipart';
 import rateLimit from '@fastify/rate-limit';
 import swagger from '@fastify/swagger';
 import swaggerUi from '@fastify/swagger-ui';
@@ -18,6 +19,7 @@ import { householdRoutes } from './modules/households/index.js';
 import { accountRoutes } from './modules/accounts/index.js';
 import { categoryRoutes } from './modules/categories/index.js';
 import { transactionRoutes } from './modules/transactions/index.js';
+import { importRoutes, IMPORT_MULTIPART_LIMITS } from './modules/transactions/import.routes.js';
 import { budgetRoutes } from './modules/budgets/index.js';
 import { savingsGoalRoutes } from './modules/savings-goals/index.js';
 import { recurringTransactionRoutes } from './modules/recurring-transactions/index.js';
@@ -246,6 +248,11 @@ export async function buildApp(): Promise<FastifyInstance> {
     },
   });
 
+  // Multipart (file uploads — used by POST /transactions/import/preview)
+  await app.register(multipart, {
+    limits: IMPORT_MULTIPART_LIMITS,
+  });
+
   // ============================================================================
   // ERROR HANDLING
   // ============================================================================
@@ -296,6 +303,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(accountRoutes, { prefix: '/accounts' });
   await app.register(categoryRoutes, { prefix: '/categories' });
   await app.register(transactionRoutes, { prefix: '/transactions' });
+  await app.register(importRoutes, { prefix: '/transactions' });
   await app.register(budgetRoutes, { prefix: '/budgets' });
   await app.register(savingsGoalRoutes, { prefix: '/savings-goals' });
   await app.register(recurringTransactionRoutes, { prefix: '/recurring-transactions' });

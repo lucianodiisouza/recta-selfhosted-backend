@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Only superseded pull request runs are cancelled; a push to main always finishes.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  gates:
+    name: Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Documented floor (20.19, the same as the frontend, which Vite 7 requires) and the current LTS.
+        node: ['20.19', 22]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # The generated Prisma Client (src/generated) is not versioned; typecheck needs it.
+      - name: Generate the Prisma Client
+        run: npm run db:generate
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      # Unit tests never touch the database; vitest.config.ts injects a dummy DATABASE_URL.
+      - name: Tests
+        run: npm test
+
+      - name: Whitespace errors (git diff --check)
+        if: github.event_name == 'pull_request'
+        run: git diff --check "origin/${{ github.base_ref }}...HEAD"
+
+  # Tests that need a real database (skipped in the job above because IMPORT_DB_TEST_URL is not set there).
+  integration:
+    name: Postgres integration tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: recta
+          POSTGRES_PASSWORD: recta
+          POSTGRES_DB: recta_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U recta -d recta_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://recta:recta@localhost:5432/recta_ci
+      IMPORT_DB_TEST_URL: postgresql://recta:recta@localhost:5432/recta_ci
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Generate the Prisma Client
+        run: npm run db:generate
+
+      - name: Apply the migrations
+        run: npm run db:deploy
+
+      - name: Integration tests
+        run: npx vitest run src/modules/transactions/import.integration.test.ts
