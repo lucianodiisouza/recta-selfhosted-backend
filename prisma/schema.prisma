@@ -165,7 +165,7 @@ model Account {
   availableLimit   Decimal?      @map("available_limit") @db.Decimal(15, 2) // Limite disponível (totalLimit - dívida atual)
   dueDay           Int?          @map("due_day") // Day of month (1-31) - vencimento da fatura
   closingDay       Int?          @map("closing_day") // Day of month (1-31) - fechamento da fatura
-  bestDayOffset    Int?          @map("best_day_offset") // Dias antes do fechamento que definem o melhor dia para compra (default 10)
+  bestDayOffset    Int?          @map("best_day_offset") // DEPRECATED, ignored: the best day to buy is the closing day (closingDay, or dueDay - 7 when null)
   linkedAccountId  String?       @map("linked_account_id") @db.Uuid // Conta bancária vinculada (para herdar cor)
   createdAt        DateTime      @default(now()) @map("created_at")
   updatedAt        DateTime      @updatedAt @map("updated_at")
@@ -279,6 +279,10 @@ model Transaction {
   attachmentUrl          String?         @map("attachment_url")
   // Split expense fields
   isSplit                Boolean         @default(false) @map("is_split") // Indica se a transação é dividida entre membros
+  // Import provenance: the stable id of the source row, `ofx:<fitid>:<hash>` for a card invoice OFX line. Unique per
+  // household (NULLs allowed, so manual transactions are unaffected): exact dedup, idempotent re-import and race-proof
+  // double submits. The prefix names the importer that wrote it and is a public contract, see README "Source references".
+  sourceRef              String?         @map("source_ref") @db.VarChar(120)
   createdAt              DateTime        @default(now()) @map("created_at")
   updatedAt              DateTime        @updatedAt @map("updated_at")
 
@@ -290,6 +294,7 @@ model Transaction {
   relatedAccount       Account?              @relation("TransactionRelatedAccount", fields: [relatedEntityId], references: [id], onDelete: SetNull)
   recurringTransaction RecurringTransaction? @relation(fields: [recurringTransactionId], references: [id], onDelete: SetNull)
   splits                TransactionSplit[]    // Divisões da transação entre membros
+  externalRefs          TransactionExternalRef[] // External lines (e.g. card invoice OFX lines) this transaction already represents
 
   // Indexes for common queries
   @@index([householdId])
@@ -303,7 +308,25 @@ model Transaction {
   @@index([date])
   @@index([recurringTransactionId])
   @@index([installmentId])
+  @@unique([householdId, sourceRef])
   @@map("transactions")
+}
+
+// External lines (e.g. card invoice OFX lines, ref `ofx:<FITID>:<hash>`) a transaction already represents. One
+// transaction may represent several lines; a ref is recorded once per household, so re-importing the same file finds
+// every line already reconciled.
+model TransactionExternalRef {
+  id            String   @id @default(uuid()) @db.Uuid
+  householdId   String   @map("household_id") @db.Uuid
+  transactionId String   @map("transaction_id") @db.Uuid
+  ref           String   @db.VarChar(120)
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  transaction Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+
+  @@unique([householdId, ref])
+  @@index([transactionId])
+  @@map("transaction_external_refs")
 }
 
 // ============================================================================

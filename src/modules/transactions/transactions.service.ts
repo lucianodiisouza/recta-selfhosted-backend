@@ -1,6 +1,6 @@
 import { Prisma } from '../../generated/prisma/client.js';
 import { prisma } from '../../shared/db/prisma.js';
-import { NotFoundError, BadRequestError, ForbiddenError } from '../../shared/errors/index.js';
+import { NotFoundError, BadRequestError, ForbiddenError, ConflictError } from '../../shared/errors/index.js';
 import {
   createPaginatedResponse,
   buildPaginationArgs,
@@ -9,6 +9,7 @@ import {
 import { CategoryType, getCategoriesByType, getCategoryColor, AccountType, TransactionType, CATEGORY_NAME_DISPLAY } from '../../shared/enums/index.js';
 import { CategoryName } from '../../shared/enums/index.js';
 import { isCustomCategoryName, toCustomCategoryId, toCustomCategoryName } from '../../shared/utils/categoryHelpers.js';
+import { effectiveClosingDay } from '../accounts/closing-day.js';
 import { executeRecurringTransaction } from '../recurring-transactions/recurring-transactions.service.js';
 import { applyTransfer, applyAllocation, applyDeallocation, recalculateCreditCardLimit, updateBalanceForNormalTransaction } from '../../shared/services/balance.service.js';
 import type {
@@ -39,11 +40,31 @@ function calculateBalanceChange(amount: number, isIncome: boolean, accountType: 
 }
 
 /**
+ * Server-side extras of a create (not part of the HTTP schema, so a client cannot set them): an importer stamps the
+ * row with the stable id of its source line.
+ */
+export type InternalCreateTransactionInput = CreateTransactionInput & { sourceRef?: string };
+
+/** Hooks of createTransaction. */
+export interface CreateTransactionHooks {
+  /**
+   * Runs inside the database transaction, after the row (and its balance effects) was written. Throwing rolls the whole
+   * create back, so the caller's own writes (for example external refs) commit or vanish together with the row.
+   */
+  inTransaction?: (tx: Prisma.TransactionClient, created: { id: string }) => Promise<void>;
+}
+
+/**
  * Create a new transaction and update account balance
  * @param input Transaction input data
  * @param userId Optional user ID - if provided, allows using personal accounts in shared household
+ * @param hooks Optional caller writes that commit or roll back together with the transaction
  */
-export async function createTransaction(input: CreateTransactionInput, userId?: string) {
+export async function createTransaction(
+  input: InternalCreateTransactionInput,
+  userId?: string,
+  hooks?: CreateTransactionHooks
+) {
   // householdId must be provided (resolved in routes via ensurePersonalHousehold)
   if (!input.householdId) {
     throw new BadRequestError('householdId is required');
@@ -189,6 +210,7 @@ export async function createTransaction(input: CreateTransactionInput, userId?: 
         ...(input.installmentId && { installmentId: input.installmentId }),
         ...(input.installmentNumber && { installmentNumber: input.installmentNumber }),
         ...(input.totalInstallments && { totalInstallments: input.totalInstallments }),
+        ...(input.sourceRef && { sourceRef: input.sourceRef }),
         ...(input.attachmentUrl && { attachmentUrl: input.attachmentUrl }),
       },
       include: {
@@ -435,6 +457,9 @@ export async function createTransaction(input: CreateTransactionInput, userId?: 
         }
       }
     }
+
+    // Caller's writes that must commit (or roll back) together with the transaction
+    if (hooks?.inTransaction) await hooks.inTransaction(tx, transaction);
 
     return transaction;
   });
@@ -704,13 +729,79 @@ export async function listTransactions(query: ListTransactionsQuery) {
   return createPaginatedResponse(convertedTransactions, limit, total);
 }
 
+/** Server-side extras of an update (not part of the HTTP schema): the importer re-points the source of a row. */
+export type InternalUpdateTransactionInput = UpdateTransactionInput & { sourceRef?: string | null };
+
+/** Hooks of updateTransaction, both run inside the same database transaction as the update. */
+export interface UpdateTransactionOptions {
+  /**
+   * Runs right after the row was locked and read again, before any balance is touched; throwing aborts the whole
+   * update with nothing written (callers record external refs here). It runs on every attempt of the retry (stale
+   * read, deadlock), each time inside a fresh database transaction, so it must be safe to run more than once.
+   */
+  beforeWrite?: (tx: Prisma.TransactionClient) => Promise<void>;
+  /** Runs after the row was written, still inside the transaction (also once per attempt). */
+  inTransaction?: (tx: Prisma.TransactionClient) => Promise<void>;
+}
+
+/** The row changed between the read and the lock in a way this update does not depend on: read again and retry. */
+class StaleRowError extends Error {
+  constructor() {
+    super('The transaction changed meanwhile');
+  }
+}
+
+const MAX_UPDATE_ATTEMPTS = 3;
+
 /**
- * Update transaction
+ * Postgres deadlock detected: two transactions locked rows (or accounts) in opposite orders; one was rolled back.
+ * With the pg driver adapter it arrives as a DriverAdapterError whose `message` is "deadlock detected" and whose
+ * code is in `cause.originalCode` (SQLSTATE 40P01); other layers put the code in `code` or `meta.code`.
+ */
+export function isDeadlock(error: unknown): boolean {
+  const e = (error ?? {}) as {
+    code?: unknown;
+    originalCode?: unknown;
+    meta?: { code?: unknown };
+    cause?: { code?: unknown; originalCode?: unknown; message?: unknown };
+    message?: unknown;
+  };
+  const codes = [e.code, e.originalCode, e.meta?.code, e.cause?.code, e.cause?.originalCode];
+  const text = [e.message, e.cause?.message].filter((m): m is string => typeof m === 'string');
+  return codes.includes('40P01') || text.some((m) => m.includes('40P01') || m.includes('deadlock detected'));
+}
+
+/**
+ * Update a transaction and adjust balances. The row is locked (SELECT ... FOR UPDATE) inside the database transaction
+ * and read again: when it still is what this call read, the update goes on; when someone changed it, the update
+ * answers 409 only if what changed is what this call intends to change or depends on to move money (the account, the
+ * amount or the type when the request sets them); any other concurrent change (a description, a note, a paid flag
+ * already set) just makes the call read the row again and apply its update on top, so independent PATCHes all apply.
+ * A deadlock between two moves that cross (A to B and B to A) rolls one back: it is retried like a stale read.
  */
 export async function updateTransaction(
   transactionId: string,
   householdId: string,
-  input: UpdateTransactionInput
+  input: InternalUpdateTransactionInput,
+  options: UpdateTransactionOptions = {}
+) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await updateTransactionOnce(transactionId, householdId, input, options);
+    } catch (error) {
+      if (!(error instanceof StaleRowError) && !isDeadlock(error)) throw error;
+      if (attempt >= MAX_UPDATE_ATTEMPTS) {
+        throw new ConflictError('The transaction is being changed by someone else; try again.');
+      }
+    }
+  }
+}
+
+async function updateTransactionOnce(
+  transactionId: string,
+  householdId: string,
+  input: InternalUpdateTransactionInput,
+  options: UpdateTransactionOptions
 ) {
   const existingTransaction = await prisma.transaction.findFirst({
     where: { id: transactionId, householdId },
@@ -778,6 +869,32 @@ export async function updateTransaction(
 
   // Update transaction and adjust balances
   const result = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+    // Lock the row and read it again: what the balance math below uses must be what is stored now.
+    await tx.$queryRaw`SELECT id FROM transactions WHERE id = ${transactionId}::uuid FOR UPDATE`;
+    const fresh = await tx.transaction.findFirst({ where: { id: transactionId, householdId } });
+    if (!fresh) throw new NotFoundError('Transaction');
+    const unchanged =
+      fresh.accountId === existingTransaction.accountId &&
+      fresh.type === existingTransaction.type &&
+      fresh.paid === existingTransaction.paid &&
+      fresh.categoryName === existingTransaction.categoryName &&
+      fresh.amount.equals(existingTransaction.amount);
+    if (!unchanged) {
+      const intentChanged =
+        (input.accountId !== undefined && fresh.accountId !== existingTransaction.accountId) ||
+        (input.amount !== undefined && !fresh.amount.equals(existingTransaction.amount)) ||
+        (input.type !== undefined && fresh.type !== existingTransaction.type);
+      if (intentChanged) {
+        throw new ConflictError('The transaction was changed by someone else; reload and try again.');
+      }
+      throw new StaleRowError();
+    }
+    // Two moves that cross (A to B and B to A) would lock the two accounts in opposite orders: always take them by id.
+    if (accountChanged && oldAccountId && newAccountId) {
+      await tx.$queryRaw`SELECT id FROM accounts WHERE id IN (${Prisma.join([oldAccountId, newAccountId].sort())}) ORDER BY id FOR UPDATE`;
+    }
+    await options.beforeWrite?.(tx);
+
     // Case 1: Type changed (INCOME <-> EXPENSE) - need to reverse old balance and apply new balance
     // This handles type change alone or with other changes
     if (typeChanged && oldAccountId && oldAccountType && oldCategoryName) {
@@ -855,6 +972,7 @@ export async function updateTransaction(
         ...(input.installmentNumber !== undefined && { installmentNumber: input.installmentNumber }),
         ...(input.totalInstallments !== undefined && { totalInstallments: input.totalInstallments }),
         ...(input.attachmentUrl !== undefined && { attachmentUrl: input.attachmentUrl }),
+        ...(input.sourceRef !== undefined && { sourceRef: input.sourceRef }),
       },
       include: {
         account: {
@@ -862,6 +980,8 @@ export async function updateTransaction(
         },
       },
     });
+
+    if (options.inTransaction) await options.inTransaction(tx);
 
     // Recalculate credit card limit if transaction is on a credit card
     if (transaction.account?.type === AccountType.CREDIT) {
@@ -1001,10 +1121,75 @@ export async function updateTransaction(
   return convertedResult;
 }
 
+export interface DeleteTransactionOptions {
+  /**
+   * Runs inside the database transaction of every delete except a paid transfer, a paid allocation and a paid split
+   * expense (which have their own paths): so for a plain income/expense, paid or not, for an unpaid transfer,
+   * allocation or split expense, and for a paid row with no account or category. It runs right after the row was
+   * locked and read again and before anything is written; throwing aborts the delete with nothing written. For callers
+   * that must recheck something atomically with the delete. It runs on every attempt of the retry.
+   */
+  guard?: (tx: Prisma.TransactionClient) => Promise<void>;
+}
+
+/** The fields the balance math of a delete depends on: if any changed between the read and the lock, read again. */
+type DeleteSnapshot = {
+  accountId: string | null;
+  fromAccountId: string | null;
+  toAccountId: string | null;
+  relatedEntityId: string | null;
+  type: string | null;
+  paid: boolean | null;
+  isSplit: boolean | null;
+  categoryName: string | null;
+  amount: Prisma.Decimal;
+};
+
+/**
+ * First thing in every delete transaction, in the same order as updateTransaction (row first, then accounts), so
+ * the two never wait for each other in opposite orders: lock the row, read it again, and give up (retry) if what the
+ * balance math used has changed. @throws NotFoundError when the row is gone.
+ */
+async function lockRowForDelete(tx: Prisma.TransactionClient, transactionId: string, householdId: string, read: DeleteSnapshot) {
+  await tx.$queryRaw`SELECT id FROM transactions WHERE id = ${transactionId}::uuid FOR UPDATE`;
+  const fresh = await tx.transaction.findFirst({ where: { id: transactionId, householdId } });
+  if (!fresh) throw new NotFoundError('Transaction');
+  const same =
+    fresh.accountId === read.accountId &&
+    fresh.fromAccountId === read.fromAccountId &&
+    fresh.toAccountId === read.toAccountId &&
+    fresh.relatedEntityId === read.relatedEntityId &&
+    fresh.type === read.type &&
+    fresh.paid === read.paid &&
+    fresh.isSplit === read.isSplit &&
+    fresh.categoryName === read.categoryName &&
+    fresh.amount.equals(read.amount);
+  if (!same) throw new StaleRowError();
+}
+
+/** Several accounts are always locked by id, as in updateTransaction. */
+async function lockAccountsById(tx: Prisma.TransactionClient, ids: Array<string | null | undefined>) {
+  const unique = [...new Set(ids.filter((id): id is string => !!id))].sort();
+  if (unique.length > 0) await tx.$queryRaw`SELECT id FROM accounts WHERE id IN (${Prisma.join(unique)}) ORDER BY id FOR UPDATE`;
+}
+
 /**
  * Delete transaction and revert account balance
  */
-export async function deleteTransaction(transactionId: string, householdId: string) {
+export async function deleteTransaction(transactionId: string, householdId: string, options: DeleteTransactionOptions = {}) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await deleteTransactionOnce(transactionId, householdId, options);
+    } catch (error) {
+      if (!(error instanceof StaleRowError) && !isDeadlock(error)) throw error;
+      if (attempt >= MAX_UPDATE_ATTEMPTS) {
+        throw new ConflictError('The transaction is being changed by someone else; try again.');
+      }
+    }
+  }
+}
+
+async function deleteTransactionOnce(transactionId: string, householdId: string, options: DeleteTransactionOptions) {
   const transaction = await prisma.transaction.findFirst({
     where: { id: transactionId, householdId },
     include: {
@@ -1036,6 +1221,8 @@ export async function deleteTransaction(transactionId: string, householdId: stri
     if (transactionType === TransactionType.TRANSFER && transaction.fromAccountId && transaction.toAccountId) {
       // Reverse transfer: move balance back
       await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+        await lockRowForDelete(tx, transactionId, householdId, transaction);
+        await lockAccountsById(tx, [transaction.fromAccountId, transaction.toAccountId]);
         await applyTransfer(tx, transaction.toAccountId!, transaction.fromAccountId!, transaction.amount.toNumber());
         await tx.transaction.delete({ where: { id: transactionId } });
       });
@@ -1043,6 +1230,8 @@ export async function deleteTransaction(transactionId: string, householdId: stri
       // Reverse allocation: move from allocated back to available
       const amount = Math.abs(transaction.amount.toNumber()); // Allocation amount is positive
       await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+        await lockRowForDelete(tx, transactionId, householdId, transaction);
+        await lockAccountsById(tx, [transaction.accountId, transaction.relatedEntityId]);
         await applyDeallocation(tx, transaction.accountId!, transaction.relatedEntityId!, amount);
         await recalculateCreditCardLimit(tx, transaction.relatedEntityId!);
         await tx.transaction.delete({ where: { id: transactionId } });
@@ -1050,6 +1239,7 @@ export async function deleteTransaction(transactionId: string, householdId: stri
     } else if (isSplit && transaction.categoryName) {
       // Split transaction: revert balances for each participant's personal account
       await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+        await lockRowForDelete(tx, transactionId, householdId, transaction);
         // Find individual split transactions in personal households
         // They have notes containing "Split da transação {transactionId}"
         const splitNotePattern = `Split da transação ${transactionId}`;
@@ -1065,6 +1255,8 @@ export async function deleteTransaction(transactionId: string, householdId: stri
             },
           },
         });
+
+        await lockAccountsById(tx, splitTransactions.map((t) => t.accountId));
 
         // Revert balance for each participant's account
         for (const splitTransaction of splitTransactions) {
@@ -1106,6 +1298,8 @@ export async function deleteTransaction(transactionId: string, householdId: stri
         transaction.account.type
       );
       await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+        await lockRowForDelete(tx, transactionId, householdId, transaction);
+        await options.guard?.(tx);
         if (transaction.accountId) {
           await updateBalanceForNormalTransaction(tx, transaction.accountId, reverseChange);
           if (transaction.account && transaction.account.type === AccountType.CREDIT) {
@@ -1117,6 +1311,8 @@ export async function deleteTransaction(transactionId: string, householdId: stri
     } else {
       // Just delete if no account or category
       await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+        await lockRowForDelete(tx, transactionId, householdId, transaction);
+        await options.guard?.(tx);
         // Delete TransactionSplit records if they exist
         if (isSplit) {
           await tx.transactionSplit.deleteMany({
@@ -1129,6 +1325,8 @@ export async function deleteTransaction(transactionId: string, householdId: stri
   } else {
     // Just delete if it wasn't paid (no balance to revert)
     await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      await lockRowForDelete(tx, transactionId, householdId, transaction);
+      await options.guard?.(tx);
       // Delete TransactionSplit records if they exist
       if (isSplit) {
         await tx.transactionSplit.deleteMany({
@@ -1737,13 +1935,98 @@ export async function getSpendingHeatmap(householdId: string, month?: string) {
 }
 
 /**
- * Calculate credit card invoice for a specific month
+ * Invoice window of a card month (month = 1..12) as UTC date-only bounds, to compare with @db.Date columns (stored as
+ * UTC midnight). With a closing day the invoice runs from the closing day of the previous month to the day before the
+ * closing day of this one, both ends inclusive (7 Jan to 6 Feb for closing day 7 and month 2024-02); without one it is
+ * the calendar month (callers pass the effective closing day: the explicit one or due day - 7). Local-time bounds made
+ * Prisma truncate both ends to the UTC day in time zones behind UTC, which counted the closing day in two invoices.
+ */
+export function creditCardInvoiceWindow(year: number, month: number, closingDay: number | null | undefined) {
+  if (closingDay) {
+    // A closing day past the end of a short month closes on that month's last day (30 in February is the 28th), so
+    // every window starts where the previous one ended and the closing date never spills into the next month.
+    const closeOn = (zeroBasedMonth: number) => Math.min(closingDay, new Date(Date.UTC(year, zeroBasedMonth + 1, 0)).getUTCDate());
+    return {
+      start: new Date(Date.UTC(year, month - 2, closeOn(month - 2))),
+      end: new Date(Date.UTC(year, month - 1, closeOn(month - 1) - 1)),
+      previousStart: new Date(Date.UTC(year, month - 3, closeOn(month - 3))),
+    };
+  }
+  return {
+    start: new Date(Date.UTC(year, month - 1, 1)),
+    end: new Date(Date.UTC(year, month, 0)),
+    previousStart: new Date(Date.UTC(year, month - 2, 1)),
+  };
+}
+
+/** Today as a UTC date-only value, comparable with @db.Date columns (stored as UTC midnight). */
+export function utcToday(now: Date = new Date()): Date {
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+}
+
+/** Ordinal (year * 12 + zero-based month) of an invoice month, used to order payments by the invoice they pay. */
+export function invoiceOrdinal(year: number, monthNum: number): number {
+  return year * 12 + (monthNum - 1);
+}
+
+/**
+ * Invoice ordinal of a payment tagged `invoice_pay:<cardId>:<YYYY>-<zero-based month>`; null when the transaction is
+ * not a payment of this card or its tag cannot be read.
+ */
+export function parseInvoicePaymentOrdinal(attachmentUrl: string | null | undefined, accountId: string): number | null {
+  const prefix = `invoice_pay:${accountId}:`;
+  if (!attachmentUrl?.startsWith(prefix)) return null;
+  const match = /^(\d{4})-(\d{1,2})$/.exec(attachmentUrl.slice(prefix.length));
+  if (!match) return null;
+  return Number(match[1]) * 12 + Number(match[2]);
+}
+
+/**
+ * Payments of a card split by the invoice they pay (their tag), not by the window their date falls in: a payment is
+ * dated on or after the closing day of its own invoice, so the date window never contains it. Payments dated after
+ * `today` (scheduled / imported for an upcoming due date) are not paid yet and are left out.
+ */
+export async function loadInvoicePayments(
+  client: Pick<Prisma.TransactionClient, 'transaction'>,
+  householdId: string,
+  accountId: string,
+  invoice: { year: number; monthNum: number },
+  today: Date
+) {
+  const rows = await client.transaction.findMany({
+    where: {
+      householdId,
+      attachmentUrl: { startsWith: `invoice_pay:${accountId}:` },
+      date: { lte: today },
+    },
+  });
+  const current = invoiceOrdinal(invoice.year, invoice.monthNum);
+  const previous: typeof rows = [];
+  const currentRows: typeof rows = [];
+  const later: typeof rows = [];
+  for (const row of rows) {
+    const ordinal = parseInvoicePaymentOrdinal(row.attachmentUrl, accountId);
+    if (ordinal === null) continue;
+    if (ordinal < current) previous.push(row);
+    else if (ordinal === current) currentRows.push(row);
+    else later.push(row);
+  }
+  const sum = (list: typeof rows) => list.reduce((total, t) => total + t.amount.toNumber(), 0);
+  // laterTotal: payments made ahead for invoices after this one; they never reduce this invoice, but the card balance holds them.
+  return { previousTotal: sum(previous), currentTotal: sum(currentRows), laterTotal: sum(later), currentRows };
+}
+
+/**
+ * Calculate credit card invoice for a specific month.
+ * `currentExpenses` is the card's net purchases in the invoice window, the figure comparable with the bank statement
+ * total; `total` is the running debt (previous balance + currentExpenses - payments), not the invoice amount.
  */
 export async function calculateCreditCardInvoice(
   accountId: string,
   month: string,
   householdId: string,
-  pagination?: { limit?: number; cursor?: string }
+  pagination?: { limit?: number; cursor?: string },
+  options?: { today?: Date }
 ) {
   // Verify account is a credit card
   const account = await prisma.account.findFirst({
@@ -1761,24 +2044,10 @@ export async function calculateCreditCardInvoice(
   // Parse month (YYYY-MM) to start and end dates
   const [year, monthNum] = month.split('-').map(Number);
   
-  // Se closingDay estiver definido, usar período de fechamento; senão, usar mês completo
-  let invoiceStart: Date;
-  let invoiceEnd: Date;
-  let previousPeriodStart: Date;
-  
-  if (account.closingDay) {
-    const closingDay = account.closingDay;
-    // Período da fatura: do closingDay do mês anterior até o closingDay do mês atual (exclusive)
-    // Exemplo: se closingDay = 7 e month = 2024-02, a fatura é de 7/jan até 6/fev
-    invoiceStart = new Date(year, monthNum - 2, closingDay); // Mês anterior, dia de fechamento
-    invoiceEnd = new Date(year, monthNum - 1, closingDay - 1, 23, 59, 59, 999); // Mês atual, dia anterior ao fechamento
-    previousPeriodStart = new Date(year, monthNum - 3, closingDay); // Período anterior
-  } else {
-    // Comportamento padrão: mês completo (compatibilidade com contas antigas)
-    invoiceStart = new Date(year, monthNum - 1, 1);
-    invoiceEnd = new Date(year, monthNum, 0, 23, 59, 59, 999);
-    previousPeriodStart = new Date(year, monthNum - 2, 1);
-  }
+  const window = creditCardInvoiceWindow(year, monthNum, effectiveClosingDay(account));
+  const invoiceStart = window.start;
+  const invoiceEnd = window.end;
+  const previousPeriodStart = window.previousStart;
 
   // Get all transactions of the credit card before the invoice period
   const previousTransactions = await prisma.transaction.findMany({
@@ -1804,19 +2073,9 @@ export async function calculateCreditCardInvoice(
     }
   }, 0);
 
-  // Get all payment transactions before the invoice period
-  const previousPayments = await prisma.transaction.findMany({
-    where: {
-      householdId,
-      attachmentUrl: { startsWith: `invoice_pay:${accountId}:` },
-      date: { lt: invoiceStart },
-    },
-  });
-
-  const previousPaymentsTotal = previousPayments.reduce(
-    (sum, t) => sum + t.amount.toNumber(),
-    0
-  );
+  // Payments by the invoice they pay (tag), already paid as of today
+  const payments = await loadInvoicePayments(prisma, householdId, accountId, { year, monthNum }, options?.today ?? utcToday());
+  const previousPaymentsTotal = payments.previousTotal;
 
   // Calculate previous balance based on transactions
   // Previous balance = all net expenses (expenses - income) before this month - all payments before this month
@@ -1829,26 +2088,22 @@ export async function calculateCreditCardInvoice(
     // No previous transactions - check if account has initial debt
     // Get current invoice period transactions to see if balance was modified
     const currentPeriodTransactions = await prisma.transaction.findMany({
-      where: {
-        OR: [
-          { accountId, householdId, date: { gte: invoiceStart, lte: invoiceEnd } },
-          { householdId, attachmentUrl: { startsWith: `invoice_pay:${accountId}:` }, date: { gte: invoiceStart, lte: invoiceEnd } },
-        ],
-      },
+      where: { accountId, householdId, date: { gte: invoiceStart, lte: invoiceEnd }, OR: [{ attachmentUrl: null }, { attachmentUrl: { not: { startsWith: `invoice_pay:${accountId}:` } } }] },
     });
-    
-    if (currentPeriodTransactions.length === 0) {
+    // The balance already holds every payment made. Those for this invoice are taken out of the total below and those
+    // for later invoices never reduce it, so both are added back here; payments for earlier invoices are not, because
+    // the branch above does not take them out either (the initial debt is what is left of the balance before them).
+    const paidSoFar = payments.currentTotal + payments.laterTotal;
+
+    if (currentPeriodTransactions.length === 0 && paidSoFar === 0) {
       // No transactions at all - use account balance as initial debt
       previousBalance = Math.max(0, account.balance.toNumber());
     } else {
       // Has transactions in current period but none before
       // Calculate net change in current period
-      let currentPeriodNetChange = 0;
+      let currentPeriodNetChange = -paidSoFar; // Payments decrease debt
       for (const t of currentPeriodTransactions) {
-        if (t.attachmentUrl?.startsWith(`invoice_pay:${accountId}:`)) {
-          // Payment decreases debt
-          currentPeriodNetChange -= t.amount.toNumber();
-        } else if (t.accountId === accountId && t.categoryName) {
+        if (t.accountId === accountId && t.categoryName) {
           // Use transaction type if available, otherwise infer from category
           const isIncome = t.type === TransactionType.INCOME || 
             (t.type !== TransactionType.EXPENSE && getCategoriesByType(CategoryType.INCOME).includes(t.categoryName as any));
@@ -1894,18 +2149,8 @@ export async function calculateCreditCardInvoice(
   const monthKey = `${year}-${monthNum - 1}`;
   const technicalIdentifier = `invoice_pay:${accountId}:${monthKey}`;
   
-  const currentPayments = await prisma.transaction.findMany({
-    where: {
-      householdId,
-      attachmentUrl: technicalIdentifier,
-      date: { gte: invoiceStart, lte: invoiceEnd },
-    },
-  });
-
-  const currentPaymentsTotal = currentPayments.reduce(
-    (sum, t) => sum + t.amount.toNumber(),
-    0
-  );
+  const currentPayments = payments.currentRows;
+  const currentPaymentsTotal = payments.currentTotal;
 
   // Total invoice = previous balance + current net expenses (expenses - income) - current payments
   const invoiceTotal = previousBalance + currentNetExpenses - currentPaymentsTotal;
@@ -1922,6 +2167,8 @@ export async function calculateCreditCardInvoice(
       {
         householdId,
         attachmentUrl: technicalIdentifier,
+        // Only payments already made, as in the total above: one still dated in the future is not paid yet.
+        date: { lte: options?.today ?? utcToday() },
       },
     ],
   };
@@ -2027,21 +2274,10 @@ export async function payCreditCardInvoice(input: PayInvoiceInput) {
     // 3. Calculate invoice (inline calculation to avoid nested transactions)
     const [invoiceYear, invoiceMonthNum] = month.split('-').map(Number);
     
-    // Se closingDay estiver definido, usar período de fechamento; senão, usar mês completo
-    let invoiceMonthStart: Date;
-    let invoiceMonthEnd: Date;
-    
-    if (creditCard.closingDay) {
-      const closingDay = creditCard.closingDay;
-      // Período da fatura: do closingDay do mês anterior até o closingDay do mês atual (exclusive)
-      invoiceMonthStart = new Date(invoiceYear, invoiceMonthNum - 2, closingDay);
-      invoiceMonthEnd = new Date(invoiceYear, invoiceMonthNum - 1, closingDay - 1, 23, 59, 59, 999);
-    } else {
-      // Comportamento padrão: mês completo
-      invoiceMonthStart = new Date(invoiceYear, invoiceMonthNum - 1, 1);
-      invoiceMonthEnd = new Date(invoiceYear, invoiceMonthNum, 0, 23, 59, 59, 999);
-    }
-    
+    const invoiceWindow = creditCardInvoiceWindow(invoiceYear, invoiceMonthNum, effectiveClosingDay(creditCard));
+    const invoiceMonthStart = invoiceWindow.start;
+    const invoiceMonthEnd = invoiceWindow.end;
+
     // Get previous transactions
     const invoicePreviousTransactions = await tx.transaction.findMany({
       where: {
@@ -2065,18 +2301,14 @@ export async function payCreditCardInvoice(input: PayInvoiceInput) {
       }
     }, 0);
 
-    const invoicePreviousPayments = await tx.transaction.findMany({
-      where: {
-        householdId: householdId!,
-        attachmentUrl: { startsWith: `invoice_pay:${accountId}:` },
-        date: { lt: invoiceMonthStart },
-      },
-    });
-
-    const invoicePreviousPaymentsTotal = invoicePreviousPayments.reduce(
-      (sum, t) => sum + t.amount.toNumber(),
-      0
+    const invoicePayments = await loadInvoicePayments(
+      tx,
+      householdId!,
+      accountId,
+      { year: invoiceYear, monthNum: invoiceMonthNum },
+      utcToday()
     );
+    const invoicePreviousPaymentsTotal = invoicePayments.previousTotal;
 
     // Calculate previous balance based on transactions
     // Previous balance = all expenses before this month - all payments before this month
@@ -2089,26 +2321,20 @@ export async function payCreditCardInvoice(input: PayInvoiceInput) {
       // No previous transactions - check if account has initial debt
       // Get current period transactions to see if balance was modified
       const currentPeriodTransactions = await tx.transaction.findMany({
-        where: {
-          OR: [
-            { accountId, householdId: householdId!, date: { gte: invoiceMonthStart, lte: invoiceMonthEnd } },
-            { householdId: householdId!, attachmentUrl: { startsWith: `invoice_pay:${accountId}:` }, date: { gte: invoiceMonthStart, lte: invoiceMonthEnd } },
-          ],
-        },
+        where: { accountId, householdId: householdId!, date: { gte: invoiceMonthStart, lte: invoiceMonthEnd }, OR: [{ attachmentUrl: null }, { attachmentUrl: { not: { startsWith: `invoice_pay:${accountId}:` } } }] },
       });
-      
-      if (currentPeriodTransactions.length === 0) {
+      // The balance already holds every payment made: see calculateCreditCardInvoice for which ones are added back.
+      const paidSoFar = invoicePayments.currentTotal + invoicePayments.laterTotal;
+
+      if (currentPeriodTransactions.length === 0 && paidSoFar === 0) {
         // No transactions at all - use account balance as initial debt
         invoicePreviousBalance = Math.max(0, creditCard.balance.toNumber());
       } else {
         // Has transactions in current period but none before
         // Calculate net change in current period
-        let currentPeriodNetChange = 0;
+        let currentPeriodNetChange = -paidSoFar; // Payments decrease debt
         for (const t of currentPeriodTransactions) {
-          if (t.attachmentUrl?.startsWith(`invoice_pay:${accountId}:`)) {
-            // Payment decreases debt
-            currentPeriodNetChange -= t.amount.toNumber();
-        } else if (t.accountId === accountId && t.categoryName) {
+        if (t.accountId === accountId && t.categoryName) {
           // Use transaction type if available, otherwise infer from category
           const isIncome = t.type === TransactionType.INCOME || 
             (t.type !== TransactionType.EXPENSE && getCategoriesByType(CategoryType.INCOME).includes(t.categoryName as any));
@@ -2149,17 +2375,7 @@ export async function payCreditCardInvoice(input: PayInvoiceInput) {
     }, 0);
 
     // Pagamentos já realizados nesta fatura (parcial ou total) — devem ser descontados do total
-    const invoiceCurrentPayments = await tx.transaction.findMany({
-      where: {
-        householdId: householdId!,
-        attachmentUrl: technicalIdentifier,
-        date: { gte: invoiceMonthStart, lte: invoiceMonthEnd },
-      },
-    });
-    const invoiceCurrentPaymentsTotal = invoiceCurrentPayments.reduce(
-      (sum, t) => sum + t.amount.toNumber(),
-      0
-    );
+    const invoiceCurrentPaymentsTotal = invoicePayments.currentTotal;
 
     // Total restante = saldo anterior + despesas líquidas do período (expenses - income) - pagamentos já feitos neste período
     const invoiceRemaining = Math.max(
@@ -2327,19 +2543,9 @@ export async function undoCreditCardPayment(
     // monthIndex is 0-indexed (0-11), convert to 1-indexed for Date constructor
     const monthNum = monthIndex + 1;
     
-    // Se closingDay estiver definido, usar período de fechamento; senão, usar mês completo
-    let monthStart: Date;
-    let monthEnd: Date;
-    
-    if (creditCard.closingDay) {
-      const closingDay = creditCard.closingDay;
-      monthStart = new Date(year, monthIndex - 1, closingDay); // Mês anterior, dia de fechamento
-      monthEnd = new Date(year, monthIndex, closingDay - 1, 23, 59, 59, 999); // Mês atual, dia anterior ao fechamento
-    } else {
-      // Comportamento padrão: mês completo
-      monthStart = new Date(year, monthIndex, 1);
-      monthEnd = new Date(year, monthNum, 0, 23, 59, 59, 999);
-    }
+    const undoWindow = creditCardInvoiceWindow(year, monthNum, effectiveClosingDay(creditCard));
+    const monthStart = undoWindow.start;
+    const monthEnd = undoWindow.end;
 
     // 4. Return amount to credit card balance (increase debt)
     const paymentAmount = paymentTransaction.amount.toNumber();
@@ -2376,7 +2582,8 @@ export async function undoCreditCardPayment(
         householdId,
         date: {
           gte: monthStart,
-          lte: paymentTransaction.date,
+          // Never past the invoice's own window: the payment is dated on or after its closing day
+          lte: paymentTransaction.date < monthEnd ? paymentTransaction.date : monthEnd,
         },
         paid: true,
         attachmentUrl: { equals: null }, // Only purchases, not payments
