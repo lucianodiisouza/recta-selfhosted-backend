@@ -7,6 +7,7 @@ import swaggerUi from '@fastify/swagger-ui';
 
 import { env, isProduction } from './shared/config/env.js';
 import { initializeFirebase } from './shared/config/firebase.js';
+import { closeAdvisoryLockPool } from './shared/db/advisory-lock.js';
 import { connectDatabase, disconnectDatabase } from './shared/db/prisma.js';
 import { runMigrations } from './shared/db/migrations.js';
 import { errorHandler } from './shared/errors/error-handler.js';
@@ -24,6 +25,7 @@ import { recurringTransactionRoutes } from './modules/recurring-transactions/ind
 import { feedbackRoutes } from './modules/feedback/index.js';
 import { notificationRoutes } from './modules/notifications/index.js';
 import { dashboardRoutes } from './modules/dashboard/index.js';
+import { peopleRoutes, transactionSharesRoutes } from './modules/people/index.js';
 
 /**
  * Build the Fastify application
@@ -121,6 +123,7 @@ export async function buildApp(): Promise<FastifyInstance> {
         { name: 'Savings Goals', description: 'Savings goal endpoints' },
         { name: 'Recurring Transactions', description: 'Recurring transaction endpoints' },
         { name: 'Feedback', description: 'User feedback endpoints' },
+        { name: 'People', description: 'People, shared expenses and balances' },
       ],
     },
   });
@@ -296,6 +299,8 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(accountRoutes, { prefix: '/accounts' });
   await app.register(categoryRoutes, { prefix: '/categories' });
   await app.register(transactionRoutes, { prefix: '/transactions' });
+  await app.register(transactionSharesRoutes, { prefix: '/transactions' });
+  await app.register(peopleRoutes, { prefix: '/people' });
   await app.register(budgetRoutes, { prefix: '/budgets' });
   await app.register(savingsGoalRoutes, { prefix: '/savings-goals' });
   await app.register(recurringTransactionRoutes, { prefix: '/recurring-transactions' });
@@ -398,6 +403,7 @@ export async function startServer(): Promise<void> {
       await app.close();
     }
     await disconnectDatabase();
+    await closeAdvisoryLockPool();
 
     console.log('👋 Server stopped');
     process.exit(0);

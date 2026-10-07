@@ -44,6 +44,7 @@ model User {
   referralsAsReferred      Referral?         @relation("Referred")
   notifications            Notification[]
   transactionSplits        TransactionSplit[]
+  people                   Person[]
 
   @@map("users")
 }
@@ -73,6 +74,8 @@ model Household {
   budgets               Budget[]
   savingsGoals          SavingsGoal[]
   recurringTransactions RecurringTransaction[]
+  people                Person[]
+  settlements           Settlement[]
 
   @@map("households")
 }
@@ -290,6 +293,8 @@ model Transaction {
   relatedAccount       Account?              @relation("TransactionRelatedAccount", fields: [relatedEntityId], references: [id], onDelete: SetNull)
   recurringTransaction RecurringTransaction? @relation(fields: [recurringTransactionId], references: [id], onDelete: SetNull)
   splits                TransactionSplit[]    // Divisões da transação entre membros
+  shares                TransactionShare[] // Parts of other people (shared expenses, no user account needed)
+  settlement            Settlement? // Settlement with a person this transaction is linked to
 
   // Indexes for common queries
   @@index([householdId])
@@ -417,6 +422,103 @@ model TransactionSplit {
   @@index([userId])
   @@index([paid])
   @@map("transaction_splits")
+}
+
+// ============================================================================
+// PEOPLE & SHARED EXPENSES (the other side of a split does not need a Recta account)
+// ============================================================================
+
+enum ShareDirection {
+  THEY_OWE_ME // I paid and the person owes me their part
+  I_OWE_THEM // I owe the person this amount
+}
+
+enum SettlementDirection {
+  RECEIVED // the person paid me
+  PAID // I paid the person
+}
+
+model Person {
+  id          String   @id @default(uuid()) @db.Uuid
+  householdId String   @map("household_id") @db.Uuid
+  name        String   @db.VarChar(100)
+  userId      String?  @map("user_id") @db.Uuid // Optional link to a Recta user
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  household   Household          @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  user        User?              @relation(fields: [userId], references: [id], onDelete: SetNull)
+  aliases     PersonAlias[]
+  shares      TransactionShare[]
+  settlements Settlement[]
+
+  @@index([householdId])
+  @@map("people")
+}
+
+// Every lookup key of a person: its name (isName) and its nicknames. `key` is the label under normalizeLabel
+// (lower case, no accents, single spaces); unique per household so names and aliases never collide, whatever the race.
+model PersonAlias {
+  id          String   @id @default(uuid()) @db.Uuid
+  householdId String   @map("household_id") @db.Uuid
+  personId    String   @map("person_id") @db.Uuid
+  label       String   @db.VarChar(100)
+  key         String   @db.VarChar(100)
+  isName      Boolean  @default(false) @map("is_name")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  person Person @relation(fields: [personId], references: [id], onDelete: Cascade)
+
+  @@unique([householdId, key])
+  @@index([personId])
+  @@map("person_aliases")
+}
+
+// A person's part of a transaction. Not a TransactionSplit: the person has no account and nothing is debited from anyone.
+model TransactionShare {
+  id            String         @id @default(uuid()) @db.Uuid
+  householdId   String         @map("household_id") @db.Uuid
+  transactionId String         @map("transaction_id") @db.Uuid
+  personId      String         @map("person_id") @db.Uuid
+  amount        Decimal        @db.Decimal(12, 2)
+  direction     ShareDirection
+  source        String         @default("manual") @db.VarChar(10) // manual | import
+  note          String?        @db.VarChar(500)
+  createdAt     DateTime       @default(now()) @map("created_at")
+  updatedAt     DateTime       @updatedAt @map("updated_at")
+
+  // Relations
+  transaction Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  person      Person      @relation(fields: [personId], references: [id], onDelete: Cascade)
+
+  @@unique([transactionId, personId, direction])
+  @@index([householdId, personId])
+  @@index([transactionId])
+  @@map("transaction_shares")
+}
+
+// Money that changed hands with a person. Optionally linked (at most once) to the real transaction behind it; deleting
+// the settlement keeps the transaction, deleting the transaction only unlinks the settlement.
+model Settlement {
+  id            String              @id @default(uuid()) @db.Uuid
+  householdId   String              @map("household_id") @db.Uuid
+  personId      String              @map("person_id") @db.Uuid
+  direction     SettlementDirection
+  amount        Decimal             @db.Decimal(12, 2)
+  date          DateTime            @db.Date
+  transactionId String?             @unique @map("transaction_id") @db.Uuid
+  note          String?             @db.VarChar(500)
+  createdAt     DateTime            @default(now()) @map("created_at")
+
+  // Relations
+  household   Household    @relation(fields: [householdId], references: [id], onDelete: Cascade)
+  person      Person       @relation(fields: [personId], references: [id], onDelete: Cascade)
+  transaction Transaction? @relation(fields: [transactionId], references: [id], onDelete: SetNull)
+
+  @@index([householdId, personId])
+  @@map("settlements")
 }
 
 // ============================================================================
