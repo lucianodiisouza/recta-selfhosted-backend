@@ -1,6 +1,7 @@
 import { Prisma } from '../../generated/prisma/client.js';
 import { prisma } from '../../shared/db/prisma.js';
 import { NotFoundError, BadRequestError } from '../../shared/errors/index.js';
+import { closingDayFromDue } from './closing-day.js';
 import { CategoryName, AccountType } from '../../shared/enums/index.js';
 import { applyTransfer } from '../../shared/services/balance.service.js';
 import type {
@@ -58,6 +59,9 @@ export async function createAccount(input: CreateAccountInput) {
   const availableBalance = isCreditCard ? initialBalance : initialBalance;
   const allocatedBalance = new Prisma.Decimal(0); // Sempre começa sem alocação
 
+  const closingDayToStore =
+    input.closingDay || (isCreditCard ? closingDayFromDue(input.dueDay) : null);
+
   const account = await prisma.account.create({
     data: {
       householdId,
@@ -72,13 +76,8 @@ export async function createAccount(input: CreateAccountInput) {
       ...(input.icon && { icon: input.icon }),
       ...(input.creditLimit && { creditLimit: new Prisma.Decimal(input.creditLimit) }),
       ...(input.dueDay && { dueDay: input.dueDay }),
-      ...(input.closingDay && { closingDay: input.closingDay }),
-      // Default to 10 days when creating a credit card without an explicit offset
-      ...(input.bestDayOffset !== undefined
-        ? { bestDayOffset: input.bestDayOffset }
-        : input.type === 'CREDIT'
-          ? { bestDayOffset: 10 }
-          : {}),
+      // A credit card without an explicit closing day stores the one derived from the due day (due - 7)
+      ...(closingDayToStore && { closingDay: closingDayToStore }),
       ...(input.linkedAccountId && { linkedAccountId: input.linkedAccountId }),
     },
   });
@@ -515,7 +514,6 @@ export async function updateAccount(accountId: string, householdId: string, inpu
     }),
     ...(input.dueDay !== undefined && { dueDay: input.dueDay }),
     ...(input.closingDay !== undefined && { closingDay: input.closingDay }),
-    ...(input.bestDayOffset !== undefined && { bestDayOffset: input.bestDayOffset }),
     ...(input.linkedAccountId !== undefined && { linkedAccountId: input.linkedAccountId }),
   };
 

@@ -165,7 +165,7 @@ model Account {
   availableLimit   Decimal?      @map("available_limit") @db.Decimal(15, 2) // Limite disponível (totalLimit - dívida atual)
   dueDay           Int?          @map("due_day") // Day of month (1-31) - vencimento da fatura
   closingDay       Int?          @map("closing_day") // Day of month (1-31) - fechamento da fatura
-  bestDayOffset    Int?          @map("best_day_offset") // Dias antes do fechamento que definem o melhor dia para compra (default 10)
+  bestDayOffset    Int?          @map("best_day_offset") // DEPRECATED, ignored: the best day to buy is the closing day (closingDay, or dueDay - 7 when null)
   linkedAccountId  String?       @map("linked_account_id") @db.Uuid // Conta bancária vinculada (para herdar cor)
   createdAt        DateTime      @default(now()) @map("created_at")
   updatedAt        DateTime      @updatedAt @map("updated_at")

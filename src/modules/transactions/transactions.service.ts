@@ -9,6 +9,7 @@ import {
 import { CategoryType, getCategoriesByType, getCategoryColor, AccountType, TransactionType, CATEGORY_NAME_DISPLAY } from '../../shared/enums/index.js';
 import { CategoryName } from '../../shared/enums/index.js';
 import { isCustomCategoryName, toCustomCategoryId, toCustomCategoryName } from '../../shared/utils/categoryHelpers.js';
+import { effectiveClosingDay } from '../accounts/closing-day.js';
 import { executeRecurringTransaction } from '../recurring-transactions/recurring-transactions.service.js';
 import { applyTransfer, applyAllocation, applyDeallocation, recalculateCreditCardLimit, updateBalanceForNormalTransaction } from '../../shared/services/balance.service.js';
 import type {
@@ -1737,7 +1738,34 @@ export async function getSpendingHeatmap(householdId: string, month?: string) {
 }
 
 /**
- * Calculate credit card invoice for a specific month
+ * Invoice window of a card month (month = 1..12) as UTC date-only bounds, to compare with @db.Date columns (stored as
+ * UTC midnight). With a closing day the invoice runs from the closing day of the previous month to the day before the
+ * closing day of this one, both ends inclusive (7 Jan to 6 Feb for closing day 7 and month 2024-02); without one it is
+ * the calendar month (callers pass the effective closing day: the explicit one or due day - 7). Local-time bounds made
+ * Prisma truncate both ends to the UTC day in time zones behind UTC, which counted the closing day in two invoices.
+ */
+export function creditCardInvoiceWindow(year: number, month: number, closingDay: number | null | undefined) {
+  if (closingDay) {
+    // A closing day past the end of a short month closes on that month's last day (30 in February is the 28th), so
+    // every window starts where the previous one ended and the closing date never spills into the next month.
+    const closeOn = (zeroBasedMonth: number) => Math.min(closingDay, new Date(Date.UTC(year, zeroBasedMonth + 1, 0)).getUTCDate());
+    return {
+      start: new Date(Date.UTC(year, month - 2, closeOn(month - 2))),
+      end: new Date(Date.UTC(year, month - 1, closeOn(month - 1) - 1)),
+      previousStart: new Date(Date.UTC(year, month - 3, closeOn(month - 3))),
+    };
+  }
+  return {
+    start: new Date(Date.UTC(year, month - 1, 1)),
+    end: new Date(Date.UTC(year, month, 0)),
+    previousStart: new Date(Date.UTC(year, month - 2, 1)),
+  };
+}
+
+/**
+ * Calculate credit card invoice for a specific month.
+ * `currentExpenses` is the card's net purchases in the invoice window, the figure comparable with the bank statement
+ * total; `total` is the running debt (previous balance + currentExpenses - payments), not the invoice amount.
  */
 export async function calculateCreditCardInvoice(
   accountId: string,
@@ -1761,24 +1789,10 @@ export async function calculateCreditCardInvoice(
   // Parse month (YYYY-MM) to start and end dates
   const [year, monthNum] = month.split('-').map(Number);
   
-  // Se closingDay estiver definido, usar período de fechamento; senão, usar mês completo
-  let invoiceStart: Date;
-  let invoiceEnd: Date;
-  let previousPeriodStart: Date;
-  
-  if (account.closingDay) {
-    const closingDay = account.closingDay;
-    // Período da fatura: do closingDay do mês anterior até o closingDay do mês atual (exclusive)
-    // Exemplo: se closingDay = 7 e month = 2024-02, a fatura é de 7/jan até 6/fev
-    invoiceStart = new Date(year, monthNum - 2, closingDay); // Mês anterior, dia de fechamento
-    invoiceEnd = new Date(year, monthNum - 1, closingDay - 1, 23, 59, 59, 999); // Mês atual, dia anterior ao fechamento
-    previousPeriodStart = new Date(year, monthNum - 3, closingDay); // Período anterior
-  } else {
-    // Comportamento padrão: mês completo (compatibilidade com contas antigas)
-    invoiceStart = new Date(year, monthNum - 1, 1);
-    invoiceEnd = new Date(year, monthNum, 0, 23, 59, 59, 999);
-    previousPeriodStart = new Date(year, monthNum - 2, 1);
-  }
+  const window = creditCardInvoiceWindow(year, monthNum, effectiveClosingDay(account));
+  const invoiceStart = window.start;
+  const invoiceEnd = window.end;
+  const previousPeriodStart = window.previousStart;
 
   // Get all transactions of the credit card before the invoice period
   const previousTransactions = await prisma.transaction.findMany({
@@ -2027,21 +2041,10 @@ export async function payCreditCardInvoice(input: PayInvoiceInput) {
     // 3. Calculate invoice (inline calculation to avoid nested transactions)
     const [invoiceYear, invoiceMonthNum] = month.split('-').map(Number);
     
-    // Se closingDay estiver definido, usar período de fechamento; senão, usar mês completo
-    let invoiceMonthStart: Date;
-    let invoiceMonthEnd: Date;
-    
-    if (creditCard.closingDay) {
-      const closingDay = creditCard.closingDay;
-      // Período da fatura: do closingDay do mês anterior até o closingDay do mês atual (exclusive)
-      invoiceMonthStart = new Date(invoiceYear, invoiceMonthNum - 2, closingDay);
-      invoiceMonthEnd = new Date(invoiceYear, invoiceMonthNum - 1, closingDay - 1, 23, 59, 59, 999);
-    } else {
-      // Comportamento padrão: mês completo
-      invoiceMonthStart = new Date(invoiceYear, invoiceMonthNum - 1, 1);
-      invoiceMonthEnd = new Date(invoiceYear, invoiceMonthNum, 0, 23, 59, 59, 999);
-    }
-    
+    const invoiceWindow = creditCardInvoiceWindow(invoiceYear, invoiceMonthNum, effectiveClosingDay(creditCard));
+    const invoiceMonthStart = invoiceWindow.start;
+    const invoiceMonthEnd = invoiceWindow.end;
+
     // Get previous transactions
     const invoicePreviousTransactions = await tx.transaction.findMany({
       where: {
@@ -2327,19 +2330,9 @@ export async function undoCreditCardPayment(
     // monthIndex is 0-indexed (0-11), convert to 1-indexed for Date constructor
     const monthNum = monthIndex + 1;
     
-    // Se closingDay estiver definido, usar período de fechamento; senão, usar mês completo
-    let monthStart: Date;
-    let monthEnd: Date;
-    
-    if (creditCard.closingDay) {
-      const closingDay = creditCard.closingDay;
-      monthStart = new Date(year, monthIndex - 1, closingDay); // Mês anterior, dia de fechamento
-      monthEnd = new Date(year, monthIndex, closingDay - 1, 23, 59, 59, 999); // Mês atual, dia anterior ao fechamento
-    } else {
-      // Comportamento padrão: mês completo
-      monthStart = new Date(year, monthIndex, 1);
-      monthEnd = new Date(year, monthNum, 0, 23, 59, 59, 999);
-    }
+    const undoWindow = creditCardInvoiceWindow(year, monthNum, effectiveClosingDay(creditCard));
+    const monthStart = undoWindow.start;
+    const monthEnd = undoWindow.end;
 
     // 4. Return amount to credit card balance (increase debt)
     const paymentAmount = paymentTransaction.amount.toNumber();
@@ -2376,7 +2369,8 @@ export async function undoCreditCardPayment(
         householdId,
         date: {
           gte: monthStart,
-          lte: paymentTransaction.date,
+          // Never past the invoice's own window: the payment is dated on or after its closing day
+          lte: paymentTransaction.date < monthEnd ? paymentTransaction.date : monthEnd,
         },
         paid: true,
         attachmentUrl: { equals: null }, // Only purchases, not payments
