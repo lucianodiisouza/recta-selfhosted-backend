@@ -1,6 +1,6 @@
 import type { FastifyError, FastifyReply, FastifyRequest } from 'fastify';
 import { ZodError } from 'zod';
-import { AppError, ValidationError } from './app-error.js';
+import { AppError, TooManyRequestsError, ValidationError } from './app-error.js';
 import { isProduction } from '../config/env.js';
 
 interface ErrorResponse {
@@ -69,7 +69,20 @@ export function errorHandler(
         ...(!isProduction && { stack: error.stack }),
       },
     };
+    // AppError resets the prototype, so `instanceof TooManyRequestsError` would be false here
+    if (error.statusCode === 429 && 'retryAfterSeconds' in error) {
+      reply.header('Retry-After', String((error as TooManyRequestsError).retryAfterSeconds));
+    }
     reply.status(error.statusCode).send(response);
+    return;
+  }
+
+  // @fastify/rate-limit throws a plain { statusCode: 429, message } object, which none of the branches above match
+  if ((error as { statusCode?: number }).statusCode === 429) {
+    reply.status(429).send({
+      success: false,
+      error: { code: 'RATE_LIMITED', message: 'Too many requests, try again later' },
+    } satisfies ErrorResponse);
     return;
   }
 

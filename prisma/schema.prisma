@@ -15,11 +15,12 @@ datasource db {
 // ============================================================================
 
 model User {
-  id          String   @id @default(uuid()) @db.Uuid
-  firebaseUid String   @unique @map("firebase_uid")
-  email       String   @unique
-  createdAt   DateTime @default(now()) @map("created_at")
-  updatedAt   DateTime @updatedAt @map("updated_at")
+  id            String   @id @default(uuid()) @db.Uuid
+  firebaseUid   String?  @unique @map("firebase_uid")
+  passwordHash  String?  @map("password_hash")
+  email         String   @unique
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
 
   // User preferences
   displayName                 String?   @map("display_name")

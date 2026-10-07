@@ -153,8 +153,9 @@ export async function getOrCreateReferralCode(userId: string): Promise<string> {
     return user.referralCode;
   }
 
-  // Generate referral code from Firebase UID
-  const cleanId = user.firebaseUid.replace(/-/g, '');
+  // Generate referral code from Firebase UID (local users fall back to userId)
+  const rawId = user.firebaseUid ?? userId;
+  const cleanId = rawId.replace(/-/g, '');
   const referralCode = cleanId.slice(0, 8).toUpperCase();
 
   // Save and return

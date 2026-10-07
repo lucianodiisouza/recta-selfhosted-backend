@@ -1,6 +1,8 @@
 import type { FastifyRequest, FastifyReply } from 'fastify';
 import type { DecodedIdToken } from 'firebase-admin/auth';
 import { getFirebaseAuth } from '../config/firebase.js';
+import { isLocalAuth } from '../config/env.js';
+import { verifyJwt } from '../../modules/auth/local.service.js';
 import { UnauthorizedError, InvalidTokenError, EmailNotVerifiedError } from '../errors/index.js';
 
 /**
@@ -56,6 +58,17 @@ export function authMiddleware(options: { requireEmailVerified?: boolean } = {})
     const token = extractBearerToken(request);
     if (!token) {
       throw new UnauthorizedError('Bearer token required');
+    }
+
+    // Local mode: verify self-signed JWT, skip Firebase and email_verified
+    if (isLocalAuth) {
+      const payload = verifyJwt(token);
+      request.authUser = {
+        uid: payload.sub,
+        email: payload.email,
+        emailVerified: true,
+      };
+      return;
     }
 
     // Verify token with Firebase

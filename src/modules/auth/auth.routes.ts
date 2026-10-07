@@ -1,4 +1,4 @@
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { authMiddleware, getAuthUser } from '../../shared/middleware/auth.middleware.js';
 import {
   getUserByFirebaseUid,
@@ -7,6 +7,37 @@ import {
 import { getOrCreatePersonalHousehold } from '../households/households.service.js';
 import { processReferralCode } from '../users/referrals.service.js';
 import { prisma } from '../../shared/db/prisma.js';
+import { env, isLocalAuth } from '../../shared/config/env.js';
+import { PASSWORD_MAX_BYTES, discardRegisteredUser, login, register } from './local.service.js';
+
+const errorResponseSchema = {
+  type: 'object',
+  properties: {
+    success: { type: 'boolean' },
+    error: {
+      type: 'object',
+      properties: {
+        code: { type: 'string' },
+        message: { type: 'string' },
+      },
+    },
+  },
+} as const;
+
+const credentialsBodySchema = {
+  type: 'object',
+  required: ['email', 'password'],
+  properties: {
+    // The email format and the 72-byte password limit are checked by local.service (zod), after the email is
+    // trimmed and lowercased; the lengths here are the cheap upper bounds (a character is at least one byte).
+    email: { type: 'string', maxLength: 254 },
+    password: { type: 'string', minLength: 8, maxLength: PASSWORD_MAX_BYTES },
+  },
+} as const;
+
+// Credential routes are the one place a password can be guessed, so they get their own, tighter limit per IP
+// (the global limit is far higher). Behind a reverse proxy, trustProxy makes the IP the proxy's X-Forwarded-For.
+const credentialsRateLimit = { rateLimit: { max: 10, timeWindow: '1 minute' } } as const;
 
 export async function authRoutes(app: FastifyInstance) {
   /**
@@ -31,7 +62,7 @@ export async function authRoutes(app: FastifyInstance) {
                 properties: {
                   id: { type: 'string', format: 'uuid' },
                   email: { type: 'string', format: 'email' },
-                  firebaseUid: { type: 'string' },
+                  firebaseUid: { type: ['string', 'null'] },
                   createdAt: { type: 'string', format: 'date-time' },
                   households: {
                     type: 'array',
@@ -54,13 +85,7 @@ export async function authRoutes(app: FastifyInstance) {
               },
             },
           },
-          401: {
-            type: 'object',
-            properties: {
-              success: { type: 'boolean' },
-              error: { type: 'string' },
-            },
-          },
+          401: errorResponseSchema,
         },
       },
       preHandler: authMiddleware(),
@@ -123,13 +148,7 @@ export async function authRoutes(app: FastifyInstance) {
               },
             },
           },
-          401: {
-            type: 'object',
-            properties: {
-              success: { type: 'boolean' },
-              error: { type: 'string' },
-            },
-          },
+          401: errorResponseSchema,
         },
       },
       preHandler: authMiddleware({ requireEmailVerified: false }),
@@ -192,6 +211,176 @@ export async function authRoutes(app: FastifyInstance) {
           emailVerified: authUser.emailVerified,
           createdAt: user.createdAt,
           householdId: household.id, // Return household ID so frontend can save it
+        },
+      });
+    }
+  );
+
+  /**
+   * POST /auth/register
+   * Register with email + password (local auth mode only)
+   */
+  app.post(
+    '/register',
+    {
+      config: credentialsRateLimit,
+      schema: {
+        description: 'Register a new user with email and password. Only available when AUTH_MODE=local.',
+        tags: ['Auth'],
+        body: credentialsBodySchema,
+        response: {
+          201: {
+            type: 'object',
+            properties: {
+              success: { type: 'boolean' },
+              data: {
+                type: 'object',
+                properties: {
+                  id: { type: 'string', format: 'uuid' },
+                  email: { type: 'string', format: 'email' },
+                  householdId: { type: 'string', format: 'uuid' },
+                },
+              },
+            },
+          },
+          400: errorResponseSchema,
+          403: errorResponseSchema,
+          404: errorResponseSchema,
+          409: errorResponseSchema,
+          429: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      if (!isLocalAuth) {
+        return reply.code(404).send({
+          success: false,
+          error: { code: 'NOT_FOUND', message: 'Local registration is not available in firebase auth mode' },
+        });
+      }
+
+      if (!env.AUTH_ALLOW_REGISTRATION) {
+        return reply.code(403).send({
+          success: false,
+          error: { code: 'REGISTRATION_DISABLED', message: 'Registration is disabled on this server' },
+        });
+      }
+
+      const body = request.body as { email: string; password: string };
+      const user = await register(body.email, body.password);
+
+      // The household helper does not take a transaction, so undo the registration if it fails: a user without a
+      // household could sign in but could not use the app, and could never register again (the email is taken).
+      let household;
+      try {
+        household = await getOrCreatePersonalHousehold(user.id, user.email);
+      } catch (error) {
+        // Best effort: if the cleanup fails too, the original error is the one worth reporting.
+        await discardRegisteredUser(user.id).catch(() => undefined);
+        throw error;
+      }
+
+      return reply.code(201).send({
+        success: true,
+        data: {
+          id: user.id,
+          email: user.email,
+          householdId: household.id,
+        },
+      });
+    }
+  );
+
+  /**
+   * POST /auth/login
+   * Login with email + password (local auth mode only)
+   */
+  app.post(
+    '/login',
+    {
+      config: credentialsRateLimit,
+      schema: {
+        description: 'Login with email and password. Only available when AUTH_MODE=local.',
+        tags: ['Auth'],
+        body: credentialsBodySchema,
+        response: {
+          200: {
+            type: 'object',
+            properties: {
+              success: { type: 'boolean' },
+              data: {
+                type: 'object',
+                properties: {
+                  token: { type: 'string' },
+                  id: { type: 'string', format: 'uuid' },
+                  email: { type: 'string', format: 'email' },
+                },
+              },
+            },
+          },
+          401: errorResponseSchema,
+          404: errorResponseSchema,
+          429: errorResponseSchema,
+        },
+      },
+    },
+    async (request, reply) => {
+      if (!isLocalAuth) {
+        return reply.code(404).send({
+          success: false,
+          error: { code: 'NOT_FOUND', message: 'Local login is not available in firebase auth mode' },
+        });
+      }
+
+      const body = request.body as { email: string; password: string };
+      const { user, token } = await login(body.email, body.password);
+
+      return reply.send({
+        success: true,
+        data: {
+          token,
+          id: user.id,
+          email: user.email,
+        },
+      });
+    }
+  );
+
+  /**
+   * GET /auth/config
+   * Public auth-mode discovery for dual-mode frontend
+   */
+  app.get(
+    '/config',
+    {
+      schema: {
+        description: 'Get auth mode configuration. Used by the frontend to select local or firebase auth flow.',
+        tags: ['Auth'],
+        response: {
+          200: {
+            type: 'object',
+            properties: {
+              success: { type: 'boolean' },
+              data: {
+                type: 'object',
+                properties: {
+                  authMode: { type: 'string', enum: ['local', 'firebase'] },
+                  firebaseWebApiKey: { type: ['string', 'null'] },
+                  registrationEnabled: { type: 'boolean' },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    async (_request: FastifyRequest, reply) => {
+      return reply.send({
+        success: true,
+        data: {
+          authMode: env.AUTH_MODE,
+          firebaseWebApiKey: env.AUTH_FIREBASE_WEB_API_KEY ?? null,
+          registrationEnabled: !isLocalAuth || env.AUTH_ALLOW_REGISTRATION,
         },
       });
     }

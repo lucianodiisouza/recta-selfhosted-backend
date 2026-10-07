@@ -146,9 +146,9 @@ export async function getHouseholdMembers(householdId: string) {
  * Invite a user to household by email (creates pending invite)
  */
 export async function inviteMember(householdId: string, inviterId: string, input: InviteMemberInput) {
-  // Find user by email
-  const user = await prisma.user.findUnique({
-    where: { email: input.email },
+  // Find user by email, ignoring case: stored emails may have capitals (Firebase keeps what the provider sent)
+  const user = await prisma.user.findFirst({
+    where: { email: { equals: input.email.trim(), mode: 'insensitive' } },
   });
 
   if (!user) {
@@ -173,7 +173,7 @@ export async function inviteMember(householdId: string, inviterId: string, input
   const existingInvite = await prisma.householdInvite.findFirst({
     where: {
       householdId,
-      email: input.email,
+      email: user.email,
       status: 'PENDING',
       expiresAt: {
         gt: new Date(),
@@ -220,7 +220,7 @@ export async function inviteMember(householdId: string, inviterId: string, input
       householdId,
       inviterId,
       inviteeId: user.id,
-      email: input.email,
+      email: user.email,
       role: input.role,
       status: 'PENDING',
       expiresAt,

@@ -1,8 +1,9 @@
 import type { FastifyRequest } from 'fastify';
 import type { HouseholdRole, Prisma } from '../../generated/prisma/client.js';
 import { prisma } from '../db/prisma.js';
-import { ForbiddenError, NotFoundError, InsufficientRoleError } from '../errors/index.js';
+import { ForbiddenError, NotFoundError, InsufficientRoleError, UnauthorizedError } from '../errors/index.js';
 import { getAuthUser } from './auth.middleware.js';
+import { isLocalAuth } from '../config/env.js';
 import * as householdsService from '../../modules/households/households.service.js';
 
 /**
@@ -33,11 +34,36 @@ function hasRoleLevel(userRole: HouseholdRole, requiredRole: HouseholdRole): boo
 }
 
 /**
+ * Look up the signed-in user without creating one (reset and delete must not create a user just to remove it).
+ * In local mode the token subject is the user id; in Firebase mode it is the Firebase UID.
+ */
+export async function findExistingUser(uid: string) {
+  return prisma.user.findUnique({
+    where: isLocalAuth ? { id: uid } : { firebaseUid: uid },
+    select: { id: true },
+  });
+}
+
+/**
  * Get user's database record from Firebase UID
  * Creates user if doesn't exist (for first login)
  * Handles case where user exists with same email but different firebaseUid
+ *
+ * In local auth mode the caller passes the user id (uuid) as firebaseUid: the lookup is by id only, and it
+ * never creates a user or sets firebaseUid, which stays null for local users. The password hash is omitted
+ * from every returned row.
  */
 export async function getUserByFirebaseUid(firebaseUid: string, email: string) {
+  if (isLocalAuth) {
+    const user = await prisma.user.findUnique({
+      where: { id: firebaseUid },
+      omit: { passwordHash: true },
+    });
+    if (!user) {
+      throw new UnauthorizedError('User not found');
+    }
+    return user;
+  }
   // Validate email - must be a non-empty string
   if (!email || email.trim() === '') {
     throw new Error('Email is required to create user');
@@ -48,6 +74,7 @@ export async function getUserByFirebaseUid(firebaseUid: string, email: string) {
   // First, try to find user by firebaseUid
   let user = await prisma.user.findUnique({
     where: { firebaseUid },
+    omit: { passwordHash: true },
   });
 
   if (user) {
@@ -58,6 +85,7 @@ export async function getUserByFirebaseUid(firebaseUid: string, email: string) {
   // This can happen if Firebase UID changed or there's data inconsistency
   const existingUserByEmail = await prisma.user.findUnique({
     where: { email: trimmedEmail },
+    select: { id: true },
   });
 
   if (existingUserByEmail) {
@@ -66,6 +94,7 @@ export async function getUserByFirebaseUid(firebaseUid: string, email: string) {
     user = await prisma.user.update({
       where: { id: existingUserByEmail.id },
       data: { firebaseUid },
+      omit: { passwordHash: true },
     });
     return user;
   }
@@ -76,6 +105,7 @@ export async function getUserByFirebaseUid(firebaseUid: string, email: string) {
       firebaseUid,
       email: trimmedEmail,
     },
+    omit: { passwordHash: true },
   });
 
   return user;

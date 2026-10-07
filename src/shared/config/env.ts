@@ -33,6 +33,28 @@ const envSchema = z.object({
   // In production, specify allowed frontend URLs
   // Example: "https://recta.app,https://www.recta.app,http://localhost:5173"
   ALLOWED_ORIGINS: z.string().optional(),
+
+  // Auth mode: 'local' issues its own JWTs (no Firebase); 'firebase' verifies Firebase ID tokens
+  AUTH_MODE: z.enum(['local', 'firebase']).default('firebase'),
+  AUTH_JWT_SECRET: z.string().min(32).optional(),
+  AUTH_TOKEN_TTL_HOURS: z.coerce.number().positive().max(24 * 365).default(720),
+  // Set to 'false' to close sign-ups on an instance that already has its users (POST /auth/register answers 403)
+  AUTH_ALLOW_REGISTRATION: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((v) => v === 'true'),
+  AUTH_FIREBASE_WEB_API_KEY: z.string().optional(),
+}).superRefine((data, ctx) => {
+  if (data.AUTH_MODE === 'local') {
+    if (!data.AUTH_JWT_SECRET || data.AUTH_JWT_SECRET.length < 32) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['AUTH_JWT_SECRET'],
+        message:
+          "AUTH_JWT_SECRET is required (min 32 chars) when AUTH_MODE=local. Generate one with: openssl rand -base64 48",
+      });
+    }
+  }
 });
 
 function validateEnv() {
@@ -77,6 +99,7 @@ export const env = validateEnv();
 export const isProduction = env.NODE_ENV === 'production';
 export const isDevelopment = env.NODE_ENV === 'development';
 export const isTest = env.NODE_ENV === 'test';
+export const isLocalAuth = env.AUTH_MODE === 'local';
 
 
 

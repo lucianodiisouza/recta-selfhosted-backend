@@ -12,7 +12,7 @@ This project is maintained by [PrimoDev](https://www.oprimo.dev).
 
 ## Tech stack
 
-- **Node.js** 20+
+- **Node.js** 20.19+ (or 22.12+)
 - **Fastify** – REST API
 - **PostgreSQL** – database
 - **Prisma** – ORM
@@ -37,7 +37,7 @@ You don't need Firebase to run a working instance — `local` auth mode plus Pos
 
 ### Prerequisites
 
-- Node.js 20+
+- Node.js 20.19+ (or 22.12+)
 - PostgreSQL 16+
 - Firebase project with Authentication enabled
 
@@ -66,13 +66,36 @@ Choose how users sign in via `AUTH_MODE`:
 
 - **`local`** (recommended for self-host) — no third-party auth. The backend issues and verifies its
   own JWTs for email/password login. Requires `AUTH_JWT_SECRET` (min 32 chars; generate with
-  `openssl rand -base64 48`). Optional: `AUTH_TOKEN_TTL_HOURS` (default 720 = 30 days),
-  `AUTH_REQUIRE_EMAIL_VERIFICATION` (default `false`). No Firebase setup needed.
+  `openssl rand -base64 48`). Optional: `AUTH_TOKEN_TTL_HOURS` (default 720 = 30 days) and `AUTH_ALLOW_REGISTRATION` (default `true`; set it to
+  `false` to close sign-ups once your users exist). No Firebase setup needed.
 - **`firebase`** (default) — Google/Apple/Email sign-in via Firebase. Provide credentials with one of
   the two options below. Optionally set the public `AUTH_FIREBASE_WEB_API_KEY` so `GET /auth/config`
   hands the client your web config.
 
 Clients call `GET /auth/config` (public) to discover the mode before showing a login screen.
+In `local` mode, clients use `POST /auth/register` and `POST /auth/login` (both public, return
+a JWT for the `Authorization: Bearer` header). `GET /auth/me` and `POST /auth/sync` work in
+both modes. `GET /auth/config` also reports `registrationEnabled`.
+
+Local mode details worth knowing when you host it:
+
+- Emails are trimmed and lowercased before they are stored or looked up, so `Ana@Example.com` and
+  `ana@example.com` are the same account. Passwords are 8 to 72 bytes (bcrypt ignores the rest).
+- Registration answers 409 for an email that is already taken, so it reveals which emails have an
+  account. Login does not: a wrong password and an unknown email answer (and take) the same.
+- `POST /auth/register` and `POST /auth/login` are limited to 10 requests per minute per IP, and a
+  given email can fail to sign in 30 times per hour (per server process, kept in memory); after that
+  login answers 429 with `Retry-After`, even for the right password. The per-email counter is what
+  stops password guessing against one account when the IP is spoofed, and its price is that anyone who
+  knows an email can lock that account out of sign-in for up to an hour by failing on purpose.
+- The server runs with `trustProxy` on, so the IP is the one in `X-Forwarded-For`: **put the app behind
+  a reverse proxy that overwrites that header** (and does not expose the app port directly). Without
+  one, a client can send a different value on every request and skip the per-IP limit, and can also
+  forge somebody else's IP (a shared NAT, say) to use up that address's allowance and block it.
+- Instances that already have users with capital letters in their emails (for example from Firebase):
+  registration and invitations compare emails ignoring case, but sign-in looks up the lowercase email,
+  so lowercase them once: `UPDATE users SET email = lower(email);`. Run it only if no two users differ
+  only by case (the unique index will refuse the update otherwise).
 
 **Firebase – option A (file):**
 
@@ -135,6 +158,7 @@ so the schema and endpoints stay in sync.
 | `npm run db:generate` | Generate Prisma Client |
 | `npm run lint` | Lint |
 | `npm run typecheck` | Type check |
+| `npm test` | Unit tests (Vitest, no database needed) |
 
 ## Recurring transactions (cron)
 
@@ -161,6 +185,10 @@ src/
 │   └── utils/
 └── jobs/               # Cron (e.g. processRecurrences)
 ```
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the checks that must pass before a push, and the pull request rules. User-facing changes are recorded in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

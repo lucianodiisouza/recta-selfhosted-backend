@@ -120,9 +120,15 @@ export class RateLimitError extends AppError {
   }
 }
 
+// ============================================================================
+// RATE LIMIT (429)
+// ============================================================================
 
-
-
-
-
-
+export class TooManyRequestsError extends AppError {
+  constructor(
+    message: string = 'Too many requests, try again later',
+    public readonly retryAfterSeconds: number = 60
+  ) {
+    super(message, 429, 'RATE_LIMITED');
+  }
+}

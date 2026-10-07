@@ -5,7 +5,7 @@ import rateLimit from '@fastify/rate-limit';
 import swagger from '@fastify/swagger';
 import swaggerUi from '@fastify/swagger-ui';
 
-import { env, isProduction } from './shared/config/env.js';
+import { env, isProduction, isLocalAuth } from './shared/config/env.js';
 import { initializeFirebase } from './shared/config/firebase.js';
 import { connectDatabase, disconnectDatabase } from './shared/db/prisma.js';
 import { runMigrations } from './shared/db/migrations.js';
@@ -363,13 +363,17 @@ export async function startServer(): Promise<void> {
         }
       }
 
-      try {
-        console.log('🔧 Initializing Firebase...');
-        initializeFirebase();
-        console.log('✅ Firebase initialized');
-      } catch (error) {
-        console.error('⚠️  Firebase initialization failed:', error);
-        // Don't exit - server can still respond to health checks
+      if (isLocalAuth) {
+        console.log('🔧 AUTH_MODE=local — skipping Firebase initialization');
+      } else {
+        try {
+          console.log('🔧 Initializing Firebase...');
+          initializeFirebase();
+          console.log('✅ Firebase initialized');
+        } catch (error) {
+          console.error('⚠️  Firebase initialization failed:', error);
+          // Don't exit - server can still respond to health checks
+        }
       }
 
       try {
