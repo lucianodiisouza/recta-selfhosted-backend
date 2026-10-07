@@ -20,8 +20,8 @@ export const createAccountSchema = z.object({
   creditLimit: z.coerce.number().positive().optional(),
   dueDay: z.number().int().min(1).max(31).optional(),
   closingDay: z.number().int().min(1).max(31).optional(),
-  // Number of days before the invoice closes that defines the "best day to buy".
-  // Default in service layer is 10 when not provided.
+  // DEPRECATED and ignored (kept so older clients keep validating): the best day to buy is the closing day, and the
+  // closing day defaults to dueDay - 7 (see closing-day.ts).
   bestDayOffset: z.number().int().min(1).max(30).optional(),
   linkedAccountId: z.string().uuid().optional(),
 });
@@ -41,6 +41,7 @@ export const updateAccountSchema = z.object({
   creditLimit: z.coerce.number().positive().nullable().optional(),
   dueDay: z.number().int().min(1).max(31).nullable().optional(),
   closingDay: z.number().int().min(1).max(31).nullable().optional(),
+  /** @deprecated ignored, see createAccountSchema */
   bestDayOffset: z.number().int().min(1).max(30).nullable().optional(),
   linkedAccountId: z.string().uuid().nullable().optional(),
 });
